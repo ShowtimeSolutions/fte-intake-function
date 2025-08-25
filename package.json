@@ -1,0 +1,8 @@
+{
+  "name": "fte-intake",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "dependencies": {
+    "googleapis": "^133.0.0"
+  }
+}
