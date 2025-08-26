@@ -144,16 +144,15 @@ function lowestStartingPriceFromRaw(items) {
   return best ? `$${best}` : null;
 }
 function buildSearchMessage(items) {
-  const compact = compactList(items, 5);
   const lowest = lowestStartingPriceFromRaw(items);
-  const bullets = compact.map(r => `• ${r.line}`).join("\n");
-
   const summary = lowest
     ? `Summary: Lowest starting price around ${lowest}.`
     : `Summary: Here are a few options.`;
 
-  return `${summary}\n\n${bullets}\n\nWould you like me to open the request form?`;
+  //  Only the summary + the CTA — no bullets.
+  return `${summary}\n\nWould you like me to open the request form?`;
 }
+
 
 // --- “Popular shows in Chicago” suggestion path ---
 async function suggestChicago() {
