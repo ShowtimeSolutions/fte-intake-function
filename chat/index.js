@@ -44,18 +44,27 @@ function toRow(c) {
   return [timestamp, artistOrEvent, qty, name, email, phone, residence, budget, notes];
 }
 
-// ---------- Serper Web Search ----------
-async function webSearch(query, location) {
+// ---------- Serper Web Search (with ticket-site bias) ----------
+async function webSearch(query, location, { preferTickets = true } = {}) {
+  // Bias toward ticket sites for cleaner, parseable snippets
+  const siteBias = preferTickets
+    ? " (site:vividseats.com OR site:ticketmaster.com)"
+    : "";
+
+  const hasTicketsWord = /\bticket(s)?\b/i.test(query);
+  const qFinal =
+    query +
+    (hasTicketsWord ? "" : " tickets") +
+    (location ? ` ${location}` : "") +
+    siteBias;
+
   const resp = await fetch("https://google.serper.dev/search", {
     method: "POST",
     headers: {
       "X-API-KEY": process.env.SERPER_API_KEY,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      q: query + (location ? ` ${location}` : ""),
-      num: 5,
-    }),
+    body: JSON.stringify({ q: qFinal, num: 5 }),
   });
   if (!resp.ok) throw new Error(await resp.text());
   const data = await resp.json();
@@ -69,24 +78,7 @@ async function webSearch(query, location) {
   return items;
 }
 
-// --- Price helpers (scrape-ish, from titles/snippets only) ---
-function guessPriceFromResults(items) {
-  const priceRE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi; // $150 or $150 - $300
-  let best = null;
-  for (const r of items || []) {
-    const hay = `${r.title} ${r.snippet}`;
-    let m;
-    while ((m = priceRE.exec(hay))) {
-      const val = parseInt(m[1], 10);
-      if (!isNaN(val) && val >= 20) {
-        if (!best || val < best) best = val; // pick the lowest reasonable price
-      }
-    }
-  }
-  return best ? `$${best}` : null;
-}
-
-// --- Pretty ticket-style formatting ---
+// --- Extract/format helpers (no links, clean bullets, summary) ---
 const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/i;
 const DATE_RE  = /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?[a-z]*\s*\d{1,2}(?:,\s*\d{4})?(?:\s*•?\s*\d{1,2}:\d{2}\s*(?:AM|PM))?/i;
 
@@ -97,25 +89,30 @@ function firstMatch(re, text) {
 function clean(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
-function normalizeItem(item) {
+// Drop irrelevant items (e.g., parking pages)
+function isIrrelevant(item) {
+  const t = `${item.title} ${item.snippet}`.toLowerCase();
+  return /parking|hotel|restaurant|faq|blog/.test(t);
+}
+// Normalize one search card into “Artist @ Venue (Date): Starting at $XX”
+function normalizeCompact(item) {
   const title = clean(item.title);
   const snip  = clean(item.snippet);
-  const url   = item.link;
 
-  const price = firstMatch(PRICE_RE, `${title} ${snip}`);
-  const date  = firstMatch(DATE_RE,  `${title} ${snip}`);
+  const price = firstMatch(PRICE_RE, `${title} ${snip}`);     // "$37"
+  const date  = firstMatch(DATE_RE,  `${title} ${snip}`);     // "Tue Aug 26 • 7:30PM"
 
-  let artist = title.split(" - ")[0] || title;
-  if (/^Concerts|Tickets|Live|Events|Sports/i.test(artist)) {
-    const m = snip.match(/^[A-Z][A-Za-z0-9 .&'-]+/);
+  let artist  = title.split(" - ")[0] || title;
+  if (/^(Concerts|Tickets|Live|Events|Sports)/i.test(artist)) {
+    const m = snip.match(/^[A-Z][A-Za-z0-9 .&'’-]+/);
     if (m) artist = m[0];
   }
 
   let venue = null;
   if (snip) {
     const parts = snip.split(". ");
-    const vSeg = parts.find(p =>
-      /(Amphitheatre|Center|Centre|Arena|Theatre|Stadium|Field|Park|Hall|Ballpark)/i.test(p)
+    const vSeg = parts.find((p) =>
+      /(Amphitheatre|Amphitheater|Center|Centre|Arena|Theatre|Theater|Stadium|Field|Park|Hall|Ballpark)/i.test(p)
     );
     if (vSeg) venue = vSeg.replace(/^From \$\d+.*/i, "");
   }
@@ -125,12 +122,44 @@ function normalizeItem(item) {
     `${date ? " (" + clean(date) + ")" : ""}` +
     `${price ? `: Starting at ${price}` : ""}`;
 
-  return { line: clean(line), link: url };
+  return {
+    line: clean(line),
+    priceNumber: price ? parseInt(price.replace(/\D/g, ""), 10) : null
+  };
 }
-function prettyList(items, max = 5) {
-  const top = (items || []).slice(0, max).map(normalizeItem);
-  const bullets = top.map(r => `• ${r.line}\n  ${r.link}`).join("\n\n");
-  return bullets || "I didn’t find anything useful yet.";
+function compactList(items, max = 5) {
+  const filtered = (items || []).filter((it) => !isIrrelevant(it)).slice(0, max);
+  const normalized = filtered.map(normalizeCompact).filter(x => x.line);
+  return normalized;
+}
+function lowestStartingPriceFromRaw(items) {
+  let best = null;
+  for (const it of items || []) {
+    const m = (it.title + " " + it.snippet).match(/\$[ ]?(\d{2,4})/);
+    if (m) {
+      const val = parseInt(m[1], 10);
+      if (!isNaN(val) && val >= 20) best = best == null ? val : Math.min(best, val);
+    }
+  }
+  return best ? `$${best}` : null;
+}
+function buildSearchMessage(items) {
+  const compact = compactList(items, 5);
+  const lowest = lowestStartingPriceFromRaw(items);
+  const bullets = compact.map(r => `• ${r.line}`).join("\n");
+
+  const summary = lowest
+    ? `Summary: Lowest starting price around ${lowest}.`
+    : `Summary: Here are a few options.`;
+
+  return `${summary}\n\n${bullets}\n\nWould you like me to open the request form?`;
+}
+
+// --- “Popular shows in Chicago” suggestion path ---
+async function suggestChicago() {
+  // Prefer the Vivid Explore page in Google results
+  const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true });
+  return buildSearchMessage(items);
 }
 
 // ---------- OpenAI ----------
@@ -233,10 +262,16 @@ function toText(nodes) {
 // ---------- Tiny intent / confirmation helpers ----------
 function looksLikeSearch(msg) {
   const q = (msg || "").toLowerCase();
-  return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game/.test(q);
+  return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game|popular|upcoming|suggest|recommend/.test(q);
 }
 function looksLikePrice(msg) {
   return /(price|prices|cost|how much)/i.test(msg || "");
+}
+function wantsSuggestions(msg) {
+  return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || "");
+}
+function mentionsChicago(msg) {
+  return /(chicago|chi-town|chitown|windy city|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || "");
 }
 function userConfirmedPurchase(text) {
   return /\b(yes|yeah|yep|sure|submit|buy|purchase|book|go ahead|let'?s do it|looks good)\b/i.test(text || "");
@@ -263,6 +298,14 @@ module.exports = async function (context, req) {
   }
 
   try {
+    // --- Support direct form capture from Framer (your RequestForm) ---
+    if (req.body?.direct_capture && req.body?.capture) {
+      await appendToSheet(toRow(req.body.capture));
+      context.res.status = 200;
+      context.res.body = { message: "Saved your request. We’ll follow up soon!", captured: req.body.capture };
+      return;
+    }
+
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const lastUser =
       [...messages].reverse().find((m) => m.role === "user")?.content || "";
@@ -272,8 +315,16 @@ module.exports = async function (context, req) {
       context.res.status = 200;
       context.res.body = {
         message: "Great — opening the request form…",
-        openForm: true, // <-- Your Framer UI should open the modal only when this flag is present
+        openForm: true, // <-- Framer only opens modal if this flag is present
       };
+      return;
+    }
+
+    // Quick path: user asked for suggestions (esp. Chicago)
+    if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
+      const msg = await suggestChicago(); // formats bullets, no links
+      context.res.status = 200;
+      context.res.body = { message: msg, results: [] };
       return;
     }
 
@@ -302,29 +353,22 @@ module.exports = async function (context, req) {
       }
 
       if (c.name === "web_search") {
-        const results = await webSearch(args.q, args.location);
-        const price = looksLikePrice(args.q) ? guessPriceFromResults(results) : null;
-        const pretty = prettyList(results, 5);
-        const msg = price
-          ? `${pretty}\n\nRough current price I’m seeing: **${price}** (varies by seat/date).\nWould you like me to open the request form?`
-          : `${pretty}\n\nWould you like me to open the request form?`;
+        const results = await webSearch(args.q, args.location, { preferTickets: true });
+        const msg = buildSearchMessage(results); // summary + clean bullets (no links)
         context.res.status = 200;
         context.res.body = { message: msg, results };
         return;
       }
     }
 
-    // Fallback: no tool calls but the user clearly asked for search/price
+    // Fallback: no tool calls but the user clearly asked for search/price/suggestions
     if (looksLikeSearch(lastUser)) {
+      // If asking price-like, keep same query; bias to Vivid Seats
       const q = looksLikePrice(lastUser)
         ? `${lastUser} site:vividseats.com`
         : lastUser;
-      const results = await webSearch(q);
-      const price = looksLikePrice(lastUser) ? guessPriceFromResults(results) : null;
-      const pretty = prettyList(results, 5);
-      const msg = price
-        ? `${pretty}\n\nRough current price I’m seeing: **${price}** (varies by seat/date).\nWould you like me to open the request form?`
-        : `${pretty}\n\nWould you like me to open the request form?`;
+      const results = await webSearch(q, /*location*/ null, { preferTickets: true });
+      const msg = buildSearchMessage(results); // summary + bullets (no links)
       context.res.status = 200;
       context.res.body = { message: msg, results, note: "fallback_search" };
       return;
