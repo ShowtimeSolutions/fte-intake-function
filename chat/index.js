@@ -47,7 +47,7 @@ function toRow(c) {
   const qty = Number.isFinite(c?.ticket_qty)
     ? c.ticket_qty
     : (parseInt(c?.ticket_qty || "", 10) || "");                                  // C
-  const budgetTier = c?.budget_tier || c?.budget || "";                           // D (accepts old 'budget' too)
+  const budgetTier = c?.budget_tier || c?.budget || "";                           // D
   const dateRange = c?.date_or_date_range || "";                                  // E
   const name = c?.name || "";                                                     // F
   const email = c?.email || "";                                                   // G
@@ -57,10 +57,8 @@ function toRow(c) {
   return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
 }
 
-
 /* =====================  Serper Search  ===================== */
 async function webSearch(query, location, { preferTickets = true, max = 5 } = {}) {
-  // Bias queries toward ticket sites (cleaner snippets with prices)
   const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com)" : "";
   const hasTicketsWord = /\bticket(s)?\b/i.test(query);
   const qFinal =
@@ -84,14 +82,14 @@ async function webSearch(query, location, { preferTickets = true, max = 5 } = {}
 
 /* =====================  Price / Formatting helpers  ===================== */
 const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi;
-const irrelevant = (t, s) => /parking|hotel|restaurant|faq|blog/i.test(`${t} ${s}`);
+const IRRELEVANT = (t, s) => /parking|hotel|restaurant|faq|blog/i.test(`${t} ${s}`);
 
 function firstPrice(text) {
   if (!text) return null;
   let m; PRICE_RE.lastIndex = 0;
   while ((m = PRICE_RE.exec(text))) {
     const val = parseInt(m[1], 10);
-    if (!isNaN(val) && val >= 30) return val; // ignore super-low noise
+    if (!isNaN(val) && val >= 30) return val;
   }
   return null;
 }
@@ -104,17 +102,15 @@ function minPriceAcross(items) {
   return best;
 }
 
-/** Try to grab the first Vivid Seats price for (query). */
 async function vividStartingPrice(q) {
   const items = await webSearch(`${q} tickets site:vividseats.com`, null, { preferTickets: true, max: 5 });
-  const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !irrelevant(it.title, it.snippet));
+  const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !IRRELEVANT(it.title, it.snippet));
   const first = vividOnly[0];
   if (!first) return null;
   const p = firstPrice(`${first.title} ${first.snippet}`);
   return p != null ? p : null;
 }
 
-/** Build the short message (summary only, no bullets). */
 function priceSummaryMessage(priceNum) {
   if (priceNum != null) {
     return `Summary: Lowest starting price around $${priceNum}.` + `\n\nWould you like me to open the request form?`;
@@ -123,21 +119,21 @@ function priceSummaryMessage(priceNum) {
 }
 
 /* =====================  OpenAI  ===================== */
-async function callOpenAI(messages) {
-  const sysPrompt = `
+function baseSystemPrompt() {
+  return `
 You are FTE’s intake assistant on a public website. Your job is to help the user get tickets in a friendly, efficient way.
 
 Conversation policy:
 - Start with a short, cheerful greeting.
-- Ask ONE short question at a time, only for fields that are missing.
-- If the user is browsing/undecided, you can search for events or provide starting prices when asked.
-- Keep replies concise; plain language; avoid long lists unless requested.
-- When you have enough details to create a request, summarize briefly and ask “Is this correct?”.
-- **If the user confirms, immediately CALL the "capture_ticket_request" tool** with the fields below. **Do NOT ask them to fill a form unless they explicitly ask for a form.**
-- The website handles opening a separate form when the user explicitly asks for it.
+- Ask ONE short question at a time for missing fields.
+- If the user is browsing/undecided, you may search for events or provide starting prices when asked.
+- Keep replies concise; plain language.
+- When you have enough to create a ticket request, provide a one-sentence summary and ask for a quick **yes** to confirm.
+- AFTER the user confirms, you MUST call the "capture_ticket_request" tool with the collected fields.
+- ONLY open the manual form if the user explicitly asks you to open the form; otherwise finalize via "capture_ticket_request".
 - Do not ask for City/Residence.
 
-Fields to capture:
+Fields to capture (for capture_ticket_request):
 - artist_or_event (string, required)
 - ticket_qty (integer, required)
 - budget_tier (string, one of: "<$50","$50–$99","$100–$149","$150–$199","$200–$249","$250–$299","$300–$349","$350–$399","$400–$499","$500+")
@@ -148,12 +144,40 @@ Fields to capture:
 - notes (string, optional, 1–2 short sentences)
 
 When the user asks about prices or “what’s on”, you may call "web_search" first and reply with a short summary (e.g., “Lowest starting price around $X”). Avoid bullets/links unless the user asks.
-`;
 
+---
+
+FEW-SHOT DIALOG EXAMPLES (style & flow)
+
+[Example 1 — collect then capture]
+User: "I want Jonas Brothers tickets"
+Assistant: "Great choice! How many tickets do you need?"
+User: "4"
+Assistant: "What budget range per ticket? (e.g. $50–$99, $100–$149)"
+User: "$100–$149"
+Assistant: "Any preferred date or date range?"
+User: "Aug 26"
+Assistant: "Got it. What's the name and email to place the request?"
+User: "Nick — nick@example.com"
+Assistant: "Thanks! Summary: 4 Jonas Brothers tickets on Aug 26, budget $100–$149, under Nick (nick@example.com). Is that correct?"
+User: "Yes"
+Assistant: [CALL capture_ticket_request with the fields]
+
+[Example 2 — price lookup then proceed]
+User: "How much are Jonas Brothers tickets in Tinley Park?"
+Assistant: [CALL web_search]
+Assistant: "Summary: Lowest starting price around $38. Want to proceed with a request?"
+User: "Yes"
+Assistant: "How many tickets do you need?"
+(continue asking one missing field at a time, then call capture_ticket_request)
+`;
+}
+
+async function callOpenAI(messages) {
   const body = {
     model: "gpt-4.1-mini",
     temperature: 0.2,
-    input: [{ role: "system", content: sysPrompt }, ...messages],
+    input: [{ role: "system", content: baseSystemPrompt() }, ...messages],
     tools: [
       {
         type: "function",
@@ -211,6 +235,63 @@ When the user asks about prices or “what’s on”, you may call "web_search" 
   return resp.json();
 }
 
+/** Force-finalization pass: after user says “yes”, compel the model to call capture_ticket_request. */
+async function callOpenAIFinalize(messages) {
+  const finalizeSystem = `
+You must now finalize the ticket request based on the conversation so far.
+- If all required fields are present (artist_or_event, ticket_qty, budget_tier, name, email), CALL "capture_ticket_request".
+- If exactly one required field is missing, ask ONE short question for that field and stop.
+- Do NOT re-start the conversation; do NOT ask for fields already provided.
+- Do NOT open the manual form. Use capture_ticket_request.
+`;
+  const body = {
+    model: "gpt-4.1-mini",
+    temperature: 0.1,
+    input: [{ role: "system", content: finalizeSystem }, ...messages],
+    tools: [
+      {
+        type: "function",
+        name: "capture_ticket_request",
+        description: "Finalize a ticket request and log to Google Sheets.",
+        parameters: {
+          type: "object",
+          properties: {
+            artist_or_event: { type: "string" },
+            ticket_qty: { type: "integer" },
+            budget_tier: {
+              type: "string",
+              enum: [
+                "<$50","$50–$99","$100–$149","$150–$199",
+                "$200–$249","$250–$299","$300–$349","$350–$399",
+                "$400–$499","$500+"
+              ]
+            },
+            date_or_date_range: { type: "string" },
+            name: { type: "string" },
+            email: { type: "string" },
+            phone: { type: "string" },
+            notes: { type: "string" }
+          },
+          required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
+        }
+      }
+    ],
+    tool_choice: "auto"
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp.ok) throw new Error(await resp.text());
+  return resp.json();
+}
+
 /* =====================  Responses helpers  ===================== */
 function digToolCalls(x) {
   if (!x) return [];
@@ -238,7 +319,7 @@ function toAssistantText(obj) {
   return "";
 }
 
-/* =====================  Intent helpers  ===================== */
+/* =====================  Intent / Guard helpers  ===================== */
 function looksLikeSearch(msg) {
   const q = (msg || "").toLowerCase();
   return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game|popular|upcoming|suggest|recommend/.test(q);
@@ -246,11 +327,12 @@ function looksLikeSearch(msg) {
 function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
 function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
 function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
-function userConfirmedPurchase(text) { return /\b(yes|yeah|yep|sure|sounds good|looks good|correct|that’s right|go ahead|confirm|book it)\b/i.test(text || ""); }
+function userConfirmedPurchase(text) { return /\b(yes|yeah|yep|sure|correct|that'?s right|looks good)\b/i.test(text || ""); }
 
-// NEW: only open the manual form if the user clearly asks for it
-function wantsManualForm(text) {
-  return /\b(open|use|show)\b.*\b(form)\b|\bmanual(ly)?\b.*\b(form|request)\b|\bfill (out )?the form\b/i.test(text || "");
+/** Did the previous assistant message look like a summary + confirmation prompt? */
+function assistantAskedToConfirm(msg) {
+  const s = (msg || "").toLowerCase();
+  return /summary|is that correct\??|does that look right\??|shall i proceed\??|confirm/i.test(s);
 }
 
 /* =====================  Azure Function entry  ===================== */
@@ -267,7 +349,7 @@ module.exports = async function (context, req) {
   if (req.method !== "POST") { context.res.status = 405; context.res.body = { error: "Method not allowed" }; return; }
 
   try {
-    // Direct form capture from Framer RequestForm (manual modal)
+    // Direct manual form capture
     if (req.body?.direct_capture && req.body?.capture) {
       await appendToSheet(toRow(req.body.capture));
       context.res.status = 200;
@@ -277,47 +359,76 @@ module.exports = async function (context, req) {
 
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+    const prevAssistant = [...messages].reverse().find((m) => m.role === "assistant")?.content || "";
 
-    // If the user EXPLICITLY asks for the manual form → open it
-    if (wantsManualForm(lastUser)) {
+    // If the user explicitly asks to open the form
+    if (/\b(open|show|fill|use)\b.*\b(form|request form)\b/i.test(lastUser)) {
       context.res.status = 200;
-      context.res.body = { message: "Sure — opening the request form…", openForm: true };
+      context.res.body = { message: "Opening the request form…", openForm: true };
       return;
     }
 
-    // NOTE: We no longer open the form just because the user said “yes”.
-    // That confirmation should make the model call capture_ticket_request.
+    // If the previous assistant asked for confirmation and the user said YES,
+    // run a force-finalization pass that MUST call capture_ticket_request.
+    if (assistantAskedToConfirm(prevAssistant) && userConfirmedPurchase(lastUser)) {
+      const forced = await callOpenAIFinalize(messages);
+      const calls = digToolCalls(forced);
 
-    // Model pass
+      if (calls.length) {
+        for (const c of calls) {
+          const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
+          if (c.name === "capture_ticket_request") {
+            await appendToSheet(toRow(args));
+            context.res.status = 200;
+            context.res.body = {
+              message: "Thanks! I saved your request. We’ll follow up shortly to confirm details.",
+              captured: args
+            };
+            return;
+          }
+        }
+      }
+
+      // If the model still didn’t call the tool, reply with the assistant text (likely one missing field)
+      const forcedText = toAssistantText(forced) || "Almost there—what’s the last missing detail?";
+      context.res.status = 200;
+      context.res.body = { message: forcedText };
+      return;
+    }
+
+    // Quick path: “suggestions in Chicago”
+    if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
+      const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true, max: 5 });
+      const best = minPriceAcross(items);
+      const msg = priceSummaryMessage(best);
+      context.res.status = 200;
+      context.res.body = { message: msg, results: [] };
+      return;
+    }
+
+    // Normal model pass
     const data = await callOpenAI(messages);
     const calls = digToolCalls(data);
     context.log("Tool calls:", JSON.stringify(calls));
-
-    let captured = null;
 
     // Run any tool calls the model asked for
     for (const c of calls) {
       const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
 
       if (c.name === "capture_ticket_request") {
-        captured = args;
-        await appendToSheet(toRow(captured));
+        await appendToSheet(toRow(args));
         context.res.status = 200;
-        context.res.body = { message: "Thanks! I saved your request. We’ll follow up shortly to confirm details.", captured };
+        context.res.body = { message: "Thanks! I saved your request. We’ll follow up shortly to confirm details.", captured: args };
         return;
       }
 
       if (c.name === "web_search") {
-        // If looks like a price query, try vivid first; else fallback to general min
         let bestNum = null;
-        if (looksLikePrice(args.q)) {
-          bestNum = await vividStartingPrice(args.q);
-        }
+        if (looksLikePrice(args.q)) bestNum = await vividStartingPrice(args.q);
         if (bestNum == null) {
           const results = await webSearch(args.q, args.location, { preferTickets: true });
           bestNum = minPriceAcross(results);
         }
-
         const msg = priceSummaryMessage(bestNum);
         context.res.status = 200;
         context.res.body = { message: msg };
@@ -328,9 +439,7 @@ module.exports = async function (context, req) {
     // Fallback: user asked a search/price question but model didn’t call tools
     if (looksLikeSearch(lastUser)) {
       let bestNum = null;
-      if (looksLikePrice(lastUser)) {
-        bestNum = await vividStartingPrice(lastUser);
-      }
+      if (looksLikePrice(lastUser)) bestNum = await vividStartingPrice(lastUser);
       if (bestNum == null) {
         const results = await webSearch(lastUser, null, { preferTickets: true });
         bestNum = minPriceAcross(results);
@@ -344,7 +453,6 @@ module.exports = async function (context, req) {
     // No tool calls and not a search → return assistant text (never empty)
     let assistantText = toAssistantText(data);
     if (!assistantText) {
-      // Helpful follow-up instead of “Got it!”
       assistantText = "Got it. Which artist or event are you looking for, and how many tickets do you need?";
     }
     context.res.status = 200;
@@ -355,6 +463,7 @@ module.exports = async function (context, req) {
     context.res.body = { error: String(e) };
   }
 };
+
 
 
 
