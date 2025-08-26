@@ -1,5 +1,5 @@
 // index.js — Azure Function (Node 18+)
-// -----------------------------------
+// ------------------------------------
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
 
@@ -31,47 +31,33 @@ async function appendToSheet(row) {
 function toRow(c) {
   const timestamp = new Date().toLocaleString("en-US", {
     timeZone: "America/Chicago",
-  });
-  const artistOrEvent = c?.artist_or_event || "";
-  const qty = Number.isFinite(c?.ticket_qty)
-    ? c.ticket_qty
-    : parseInt(c?.ticket_qty || "", 10) || "";
-  const name = c?.name || "";
-  const email = c?.email || "";
-  const phone = c?.phone || "";
-  const residence = c?.city_or_residence || c?.city || "";
-  const budget = c?.budget || "";
-  const notes = c?.notes || "";
+  }); // A
+  const artistOrEvent = c?.artist_or_event || ""; // B
+  const qty =
+    Number.isFinite(c?.ticket_qty) ? c.ticket_qty : parseInt(c?.ticket_qty || "", 10) || ""; // C
+  const name = c?.name || ""; // D
+  const email = c?.email || ""; // E
+  const phone = c?.phone || ""; // F
+  const residence = c?.city_or_residence || c?.city || ""; // G
+  const budget = c?.budget || ""; // H
+  const notes = c?.notes || ""; // I
   return [timestamp, artistOrEvent, qty, name, email, phone, residence, budget, notes];
 }
 
 // ---------- Serper Web Search ----------
-const HAVE_SERPER = !!process.env.SERPER_API_KEY;
-
 async function webSearch(query, location) {
-  if (!HAVE_SERPER) {
-    console.error("[web_search] SERPER_API_KEY is missing");
-    throw new Error("SERPER_API_KEY is not set in Azure App Settings.");
-  }
-
-  const q = query + (location ? ` ${location}` : "");
-  console.log("[web_search] q=%s loc=%s", query, location || "");
-
   const resp = await fetch("https://google.serper.dev/search", {
     method: "POST",
     headers: {
       "X-API-KEY": process.env.SERPER_API_KEY,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ q, num: 5 }),
+    body: JSON.stringify({
+      q: query + (location ? ` ${location}` : ""),
+      num: 5,
+    }),
   });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    console.error("[web_search] HTTP %s – %s", resp.status, text);
-    throw new Error(`Serper error ${resp.status}: ${text}`);
-  }
-
+  if (!resp.ok) throw new Error(await resp.text());
   const data = await resp.json();
 
   const items = (data.organic || []).map((r, i) => ({
@@ -80,45 +66,84 @@ async function webSearch(query, location) {
     link: r.link,
     snippet: r.snippet,
   }));
-
-  console.log("[web_search] found %d items", items.length);
   return items;
 }
 
-function formatSearchResults(items) {
-  if (!items?.length) return "I didn’t find anything useful yet.";
-  const lines = items.map(
-    (r) => `• ${r.title}\n  ${r.snippet}\n  ${r.link}`
-  );
-  return `Here are a few options I found:\n\n${lines.join("\n\n")}`;
-}
-
-// --- Price helper: pull a plausible $ amount from snippets/titles ---
+// --- Price helpers (scrape-ish, from titles/snippets only) ---
 function guessPriceFromResults(items) {
-  const priceRE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/g; // $150 or $150 - $300
+  const priceRE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi; // $150 or $150 - $300
   let best = null;
-
   for (const r of items || []) {
     const hay = `${r.title} ${r.snippet}`;
     let m;
     while ((m = priceRE.exec(hay))) {
       const val = parseInt(m[1], 10);
       if (!isNaN(val) && val >= 20) {
-        if (!best || val < best) best = val; // take the lowest reasonable price
+        if (!best || val < best) best = val; // pick the lowest reasonable price
       }
     }
   }
-  return best ? `$${best.toString()}` : null;
+  return best ? `$${best}` : null;
+}
+
+// --- Pretty ticket-style formatting ---
+const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/i;
+const DATE_RE  = /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?[a-z]*\s*\d{1,2}(?:,\s*\d{4})?(?:\s*•?\s*\d{1,2}:\d{2}\s*(?:AM|PM))?/i;
+
+function firstMatch(re, text) {
+  const m = (text || "").match(re);
+  return m ? m[0] : null;
+}
+function clean(s) {
+  return (s || "").replace(/\s+/g, " ").trim();
+}
+function normalizeItem(item) {
+  const title = clean(item.title);
+  const snip  = clean(item.snippet);
+  const url   = item.link;
+
+  const price = firstMatch(PRICE_RE, `${title} ${snip}`);
+  const date  = firstMatch(DATE_RE,  `${title} ${snip}`);
+
+  let artist = title.split(" - ")[0] || title;
+  if (/^Concerts|Tickets|Live|Events|Sports/i.test(artist)) {
+    const m = snip.match(/^[A-Z][A-Za-z0-9 .&'-]+/);
+    if (m) artist = m[0];
+  }
+
+  let venue = null;
+  if (snip) {
+    const parts = snip.split(". ");
+    const vSeg = parts.find(p =>
+      /(Amphitheatre|Center|Centre|Arena|Theatre|Stadium|Field|Park|Hall|Ballpark)/i.test(p)
+    );
+    if (vSeg) venue = vSeg.replace(/^From \$\d+.*/i, "");
+  }
+
+  const line =
+    `${clean(artist)}${venue ? " @ " + clean(venue) : ""}` +
+    `${date ? " (" + clean(date) + ")" : ""}` +
+    `${price ? `: Starting at ${price}` : ""}`;
+
+  return { line: clean(line), link: url };
+}
+function prettyList(items, max = 5) {
+  const top = (items || []).slice(0, max).map(normalizeItem);
+  const bullets = top.map(r => `• ${r.line}\n  ${r.link}`).join("\n\n");
+  return bullets || "I didn’t find anything useful yet.";
 }
 
 // ---------- OpenAI ----------
-async function callOpenAI(messages, forceSearch = false) {
+async function callOpenAI(messages) {
   const sysPrompt = `
 You are FTE's intake assistant. You can (1) collect ticket request details and save them,
 or (2) search the web for events/venues/dates when the user is still deciding.
 
-When the user asks about events, shows, what's on, dates, venues, availability, or prices,
+When the user asks about events, what's on, dates, venues, availability, or prices,
 you MUST call the web_search tool FIRST with a good query (include location if known).
+
+Do NOT ask for personal or contact details in chat. If the user wants to proceed,
+just confirm and the website will open a form to collect details.
 
 Tools you may call:
 - capture_ticket_request: when the user is ready to submit details.
@@ -167,11 +192,9 @@ Keep replies short & friendly. Fields for capture:
         },
       },
     ],
-    // Step 3: temporarily force the search tool for debugging if it "looks" like a search query
-    tool_choice: forceSearch ? { type: "function", name: "web_search" } : "auto",
+    tool_choice: "auto",
   };
 
-  console.log("[openai] tool_choice:", body.tool_choice);
   const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -185,20 +208,16 @@ Keep replies short & friendly. Fields for capture:
   return resp.json();
 }
 
-// ---------- Helpers for Responses API ----------
+// ---------- Responses API helpers ----------
 function digToolCalls(x) {
   if (!x) return [];
   if (Array.isArray(x)) return x.flatMap(digToolCalls);
   const out = [];
-  if (x.type === "tool_call" && x.name) {
-    console.log("[tool_call]", x.name, x.arguments || "");
-    out.push(x);
-  }
+  if (x.type === "tool_call" && x.name) out.push(x);
   if (x.output) out.push(...digToolCalls(x.output));
   if (x.content) out.push(...digToolCalls(x.content));
   return out;
 }
-
 function toText(nodes) {
   if (!nodes) return "";
   if (typeof nodes === "string") return nodes;
@@ -211,15 +230,16 @@ function toText(nodes) {
   return "";
 }
 
-// Small intent heuristic for fallback
+// ---------- Tiny intent / confirmation helpers ----------
 function looksLikeSearch(msg) {
   const q = (msg || "").toLowerCase();
-  return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|sports|game/.test(
-    q
-  );
+  return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game/.test(q);
 }
 function looksLikePrice(msg) {
   return /(price|prices|cost|how much)/i.test(msg || "");
+}
+function userConfirmedPurchase(text) {
+  return /\b(yes|yeah|yep|sure|submit|buy|purchase|book|go ahead|let'?s do it|looks good)\b/i.test(text || "");
 }
 
 // ---------- Azure Function entry ----------
@@ -244,22 +264,30 @@ module.exports = async function (context, req) {
 
   try {
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-    const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+    const lastUser =
+      [...messages].reverse().find((m) => m.role === "user")?.content || "";
 
-    // Step 3: toggle this to true while debugging to *force* a search when the text looks searchy
-    const FORCE_SEARCH = looksLikeSearch(lastUser);
-    console.log("[entry] lastUser=%s | FORCE_SEARCH=%s", lastUser, FORCE_SEARCH);
+    // If user said "yes/submit/buy", instruct UI to open the form.
+    if (userConfirmedPurchase(lastUser)) {
+      context.res.status = 200;
+      context.res.body = {
+        message: "Great — opening the request form…",
+        openForm: true, // <-- Your Framer UI should open the modal only when this flag is present
+      };
+      return;
+    }
 
     // First model pass
-    const data = await callOpenAI(messages, FORCE_SEARCH);
+    const data = await callOpenAI(messages);
     const calls = digToolCalls(data);
-    console.log("[entry] tool calls detected:", JSON.stringify(calls));
+    context.log("Tool calls detected:", JSON.stringify(calls));
 
     let captured = null;
 
-    // If model asked for any tools, run them and answer
+    // If the model asked for any tools, run them and answer
     for (const c of calls) {
-      const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
+      const args =
+        typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
 
       if (c.name === "capture_ticket_request") {
         captured = args;
@@ -276,38 +304,39 @@ module.exports = async function (context, req) {
       if (c.name === "web_search") {
         const results = await webSearch(args.q, args.location);
         const price = looksLikePrice(args.q) ? guessPriceFromResults(results) : null;
-        const msg =
-          price
-            ? `${formatSearchResults(results)}\n\nRough current price I’m seeing: **${price}** (varies by seat/date). Want to submit a request?`
-            : formatSearchResults(results);
+        const pretty = prettyList(results, 5);
+        const msg = price
+          ? `${pretty}\n\nRough current price I’m seeing: **${price}** (varies by seat/date).\nWould you like me to open the request form?`
+          : `${pretty}\n\nWould you like me to open the request form?`;
         context.res.status = 200;
         context.res.body = { message: msg, results };
         return;
       }
     }
 
-    // ---- Fallback: no tool calls, but looks like search/price -> do it ourselves
+    // Fallback: no tool calls but the user clearly asked for search/price
     if (looksLikeSearch(lastUser)) {
       const q = looksLikePrice(lastUser)
         ? `${lastUser} site:vividseats.com`
         : lastUser;
       const results = await webSearch(q);
       const price = looksLikePrice(lastUser) ? guessPriceFromResults(results) : null;
-      const msg =
-        price
-          ? `${formatSearchResults(results)}\n\nRough current price I’m seeing: **${price}** (varies by seat/date). Want to submit a request?`
-          : formatSearchResults(results);
+      const pretty = prettyList(results, 5);
+      const msg = price
+        ? `${pretty}\n\nRough current price I’m seeing: **${price}** (varies by seat/date).\nWould you like me to open the request form?`
+        : `${pretty}\n\nWould you like me to open the request form?`;
       context.res.status = 200;
       context.res.body = { message: msg, results, note: "fallback_search" };
       return;
     }
 
     // No tools and not a searchy message → plain assistant text
-    const assistantText = toText(data?.output ?? data?.content ?? []) || "Got it!";
+    const assistantText =
+      toText(data?.output ?? data?.content ?? []) || "Got it!";
     context.res.status = 200;
     context.res.body = { message: assistantText, captured: null };
   } catch (e) {
-    console.error(e);
+    context.log.error(e);
     context.res.status = 500;
     context.res.body = { error: String(e) };
   }
