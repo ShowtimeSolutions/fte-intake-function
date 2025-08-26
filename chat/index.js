@@ -116,13 +116,11 @@ function priceSummaryMessage(priceNum) {
   return `Summary: I couldn’t confirm a current starting price just yet.` + `\n\nWould you like me to open the request form?`;
 }
 
-/* =====================  Guardrail extraction  ===================== */
-/** Map free-form budget phrases to your tiers. */
+/* =====================  Deterministic extraction  ===================== */
 function normalizeBudgetTier(text = "") {
   const t = text.toLowerCase();
   const num = parseInt(t.replace(/[^\d]/g, ""), 10);
 
-  // explicit tiers
   if (/(<\s*\$?50|under\s*50|less\s*than\s*\$?50)/i.test(text)) return "<$50";
   if (/\b(50[\s–-]?99|50-99|50 to 99)\b/i.test(text)) return "$50–$99";
   if (/\b(100[\s–-]?149|100-149|100 to 149)\b/i.test(text)) return "$100–$149";
@@ -134,7 +132,6 @@ function normalizeBudgetTier(text = "") {
   if (/(400|450)/i.test(text)) return "$400–$499";
   if (/\$?500\+|over\s*\$?500|>\s*\$?500/i.test(text)) return "$500+";
 
-  // “around 100”, “~120”
   if (!isNaN(num)) {
     if (num < 50) return "<$50";
     if (num < 100) return "$50–$99";
@@ -147,7 +144,7 @@ function normalizeBudgetTier(text = "") {
     if (num < 500) return "$400–$499";
     return "$500+";
   }
-  return ""; // unknown
+  return "";
 }
 
 const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
@@ -160,58 +157,54 @@ function extractFromTranscript(messages) {
   const userTexts = messages.filter(m => m.role === "user").map(m => String(m.content||""));
   const allText = messages.map(m => String(m.content || "")).join("\n");
 
-  // artist/event: best guess = first “looking for” or first user mention
+  // artist/event: pick last user line that looks like an artist/event ask
   let artist = "";
-  for (const t of userTexts) {
-    const m = t.match(/(?:see|want|looking.*for|tickets? for|go to)\s+(.+)/i);
-    if (m) { artist = m[1].replace(/tickets?$/i, "").trim(); break; }
+  for (let i = userTexts.length - 1; i >= 0; i--) {
+    const t = userTexts[i];
+    if (/\b(tickets?|concert|show|event)\b/i.test(t) || /jonas|taylor|drake|bears|bulls|cubs|concert/i.test(t)) {
+      artist = t.replace(/(tickets?|concert|show|event)/ig, "").trim();
+      if (!/^hi|hello|hey$/i.test(artist)) break;
+    }
   }
-  // fallback to first user message content
   if (!artist && userTexts.length) artist = userTexts[0].trim();
+  artist = artist.replace(/^[\s"']+|[\s"']+$/g, "");
+  if (/^hi|hello|hey$/i.test(artist)) artist = "";
 
-  // qty: last numeric 1–12 in user msgs
+  // qty
   let qty = null;
   for (let i = userTexts.length-1; i >= 0; i--) {
     const m = userTexts[i].match(QTY_RE);
     if (m) { qty = parseInt(m[1], 10); if (qty>0 && qty<=12) break; }
   }
 
-  // budget tier: last budget-ish phrase
+  // budget
   let budget_tier = "";
   for (let i = userTexts.length-1; i >= 0; i--) {
     const bt = normalizeBudgetTier(userTexts[i]);
     if (bt) { budget_tier = bt; break; }
   }
 
-  // date or date range
+  // date / date range
   let date_or_date_range = "";
   const dm = allText.match(DATE_WORDS);
   if (dm) date_or_date_range = dm[0];
 
-  // name: try "i am NAME", or a bare “First Last” from a “my name is …”
+  // name
   let name = "";
   const nameMatch = allText.match(/\bmy name is ([a-z ,.'-]{2,60})/i) || allText.match(/\bi am ([a-z ,.'-]{2,60})/i);
   if (nameMatch) name = nameMatch[1].trim();
-  // sometimes user sends "nick lynch, email@"
-  for (const t of userTexts) {
-    if (!name && /[,]/.test(t) && EMAIL_RE.test(t)) {
-      name = t.split(",")[0].trim();
-      break;
-    }
+  for (const t of userTexts) { // “Nick Lynch, nick@…”
+    if (!name && /[,]/.test(t) && EMAIL_RE.test(t)) { name = t.split(",")[0].trim(); break; }
   }
 
   // email / phone
   const email = (allText.match(EMAIL_RE) || [""])[0];
   const phone = (allText.match(PHONE_RE) || [""])[0];
 
-  // notes: look for “aisle/ADA/notes”
+  // notes
   let notes = "";
   if (/aisle/i.test(allText)) notes = (notes ? notes + "; " : "") + "Aisle seat preferred";
   if (/ada|accessible/i.test(allText)) notes = (notes ? notes + "; " : "") + "ADA/accessible";
-
-  // cleanup artist (remove trailing punctuation)
-  artist = (artist || "").replace(/^[\s"']+|[\s"']+$/g, "");
-  if (/^hi|hello|hey$/i.test(artist)) artist = "";
 
   return {
     artist_or_event: artist || "",
@@ -229,7 +222,7 @@ function haveRequired(c) {
   return !!(c.artist_or_event && c.ticket_qty && c.budget_tier && c.name && c.email);
 }
 function userConfirmed(text) {
-  return /\b(yes|yep|yeah|correct|confirm|finalize|go ahead|place it|submit|that’s right|looks good)\b/i.test(text || "");
+  return /\b(yes|yep|yeah|correct|confirm|finalize|go ahead|place it|submit|that’s right|that's right|looks good|proceed)\b/i.test(text || "");
 }
 function userAskedForm(text) {
   return /\b(open|use|show)\b.*\b(form)\b|\bmanual request\b/i.test(text || "");
@@ -241,7 +234,7 @@ async function callOpenAI(messages) {
 You are FTE’s intake assistant on a public website.
 
 Behavior:
-- Be conversational and concise. Ask one missing field at a time (artist/event & city if mentioned, ticket_qty, budget_tier, date_or_date_range, name, email, optional phone/notes).
+- Be conversational and concise. Ask one missing field at a time (artist/event, ticket_qty, budget_tier, date_or_date_range, name, email, optional phone/notes).
 - When the user confirms the details are correct, CALL the capture_ticket_request tool with the fields below.
 - Do NOT ask for City/Residence.
 - If the user asks about what's on or prices, call web_search and reply with a one-line summary price (no links).
@@ -255,7 +248,7 @@ Fields:
 - name (string, required)
 - email (string, required)
 - phone (string, optional)
-- notes (string, optional; keep to 1–2 short phrases)
+- notes (string, optional, short)
 `;
 
   const body = {
@@ -378,6 +371,7 @@ module.exports = async function (context, req) {
 
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")?.content || "";
 
     // If user explicitly asks for the form, instruct UI to open it
     if (userAskedForm(lastUser)) {
@@ -386,7 +380,7 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // ---------- Guardrail: if transcript already contains everything & user confirms, capture directly
+    // ---------- Deterministic finalize: if transcript already has everything AND user confirms, capture directly
     const extracted = extractFromTranscript(messages);
     if (haveRequired(extracted) && userConfirmed(lastUser)) {
       await appendToSheet(toRow(extracted));
@@ -399,7 +393,7 @@ module.exports = async function (context, req) {
     }
 
     // ---------- Quick path: suggestions in Chicago
-    if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
+    if (!haveRequired(extracted) && wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
       const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true, max: 5 });
       const best = minPriceAcross(items);
       const msg = priceSummaryMessage(best);
@@ -441,7 +435,6 @@ module.exports = async function (context, req) {
       }
     }
 
-    // ---------- Fallbacks
     // ---------- Fallbacks (only if we don't already have a complete request)
     if (!haveRequired(extracted) && looksLikeSearch(lastUser)) {
       let bestNum = null;
@@ -456,11 +449,15 @@ module.exports = async function (context, req) {
       return;
     }
 
-
-    // If no tool call & not a search, pass through assistant text (and keep conversation moving)
+    // No tool call & not a search → pass through assistant text (keep conversation moving)
     let assistantText = toAssistantText(data);
     if (!assistantText) {
-      assistantText = "Great — which artist or event are you looking for, and how many tickets do you need?";
+      // helpful nudge, not "Got it"
+      if (!haveRequired(extracted)) {
+        assistantText = "Great — which artist or event are you looking for, and how many tickets do you need?";
+      } else {
+        assistantText = "I’ve got your details. If everything looks good, say “proceed” and I’ll place your request.";
+      }
     }
     context.res.status = 200;
     context.res.body = { message: assistantText };
