@@ -127,14 +127,14 @@ function mapBudgetToTier(text) {
   if (!text) return "";
   const t = String(text).toLowerCase();
 
-  // Direct range mention
+  // exact mention of enum
   for (const tier of BUDGET_ENUM) {
     const plain = tier.replace("–", "-");
     const re = new RegExp(plain.replace("$","\\$").replace("+","\\+"), "i");
     if (re.test(t)) return tier;
   }
 
-  // "around 100", "~120", "about $140"
+  // approximate numeric
   const m = t.match(/\$?\s?(\d{2,4})/);
   if (m) {
     const n = parseInt(m[1], 10);
@@ -271,7 +271,6 @@ function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|ro
 function userConfirmedPurchase(text) { return /\b(yes|yeah|yep|sure|submit|buy|purchase|book|go ahead|let'?s do it|looks good|confirm)\b/i.test(text || ""); }
 
 /* =====================  Force-save helpers  ===================== */
-/** Find the most recent assistant "Summary:" message */
 function getLatestSummary(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -281,49 +280,35 @@ function getLatestSummary(messages) {
   }
   return "";
 }
-
-/** Extract fields from our summary sentence formats */
 function parseFromSummary(text) {
   if (!text) return null;
-
-  // Example:
-  // "Summary: 4 Jonas Brothers tickets for today, budget $100–$149, under Nick Lynch (nick@example.com). Is that correct?"
   const out = {};
 
-  // qty + artist
   const m1 = text.match(/summary:\s*(\d+)\s+(.+?)\s+tickets/i);
   if (m1) {
     out.ticket_qty = parseInt(m1[1], 10);
     out.artist_or_event = m1[2].trim();
   }
-
-  // date (optional) — look after "for ..."
   const m2 = text.match(/\btickets\s+for\s+([^,\.]+)/i);
   if (m2) out.date_or_date_range = m2[1].trim();
 
-  // budget tier
   const m3 = text.match(/\bbudget\s+([$\d–\-+<> ]+)/i);
   if (m3) out.budget_tier = mapBudgetToTier(m3[1]);
 
-  // name & email
   const m4 = text.match(/\bunder\s+([^(\.]+)\s*\(([^)]+)\)/i);
   if (m4) {
     out.name = m4[1].trim();
     out.email = m4[2].trim();
   } else {
-    // sometimes name/email may be phrased differently
     const email = (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [])[0];
     if (email) out.email = email;
   }
 
-  // If we got the required fields return it, else null
   if (out.artist_or_event && Number.isFinite(out.ticket_qty) && out.budget_tier && out.name && out.email) {
     return out;
   }
   return null;
 }
-
-/** Light scan of the whole transcript to enrich missing optional fields */
 function enrichOptionalFromTranscript(obj, messages) {
   const transcript = messages.map(m => m.content || "").join("\n");
   if (!obj.email) {
@@ -341,8 +326,6 @@ function enrichOptionalFromTranscript(obj, messages) {
   }
   return obj;
 }
-
-/** Try to force-save a captured request based on YES + latest summary */
 async function maybeForceSaveOnYes(messages, context) {
   const lastUser = [...messages].reverse().find(m => m.role === "user")?.content || "";
   if (!userConfirmedPurchase(lastUser)) return null;
@@ -389,11 +372,11 @@ module.exports = async function (context, req) {
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
 
-    // NEW: If user said "yes" after a Summary → force-save now (backend guarantee)
+    // NEW: Force-save when user says yes after a Summary
     const forced = await maybeForceSaveOnYes(messages, context);
     if (forced) return;
 
-    // Suggestions (Chicago)
+    // Suggestions (Chicago quick path)
     if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
       const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true, max: 5 });
       const best = minPriceAcross(items);
@@ -408,7 +391,7 @@ module.exports = async function (context, req) {
     const calls = digToolCalls(data);
     context.log("Tool calls:", JSON.stringify(calls));
 
-    // Execute any tool calls requested by the model
+    // Execute model tool calls
     for (const c of calls) {
       const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
 
@@ -433,10 +416,33 @@ module.exports = async function (context, req) {
       }
     }
 
-    // Fallback: user asked a search/price question but model didn’t call tools
+    // Fallback: searchy message but no tool call
     if (looksLikeSearch(lastUser)) {
       let bestNum = null;
       if (looksLikePrice(lastUser)) bestNum = await vividStartingPrice(lastUser);
+      if (bestNum == null) {
+        const results = await webSearch(lastUser, null, { preferTickets: true });
+        bestNum = minPriceAcross(results);
+      }
+      const msg = priceSummaryMessage(bestNum);
+      context.res.status = 200;
+      context.res.body = { message: msg, note: "fallback_search" };
+      return;
+    }
+
+    // No tools & not search → assistant text (guard against empty)
+    let assistantText = toAssistantText(data);
+    if (!assistantText) {
+      assistantText = "Great — which artist or event are you looking for, and how many tickets do you need?";
+    }
+    context.res.status = 200;
+    context.res.body = { message: assistantText, captured: null };
+  } catch (e) {
+    context.log.error(e);
+    context.res.status = 500;
+    context.res.body = { error: String(e) };
+  }
+};
 
 
 
