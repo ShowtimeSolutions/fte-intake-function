@@ -44,11 +44,10 @@ function toRow(c) {
   return [timestamp, artistOrEvent, qty, name, email, phone, residence, budget, notes];
 }
 
-// ---------- Serper Web Search (with ticket-site bias) ----------
+// ---------- Serper Web Search (ticket-site bias option) ----------
 async function webSearch(query, location, { preferTickets = true } = {}) {
-  // Bias toward ticket sites for cleaner, parseable snippets
   const siteBias = preferTickets
-    ? " (site:vividseats.com OR site:ticketmaster.com)"
+    ? " (site:vividseats.com OR site:ticketmaster.com OR site:seatgeek.com OR site:stubhub.com OR site:axs.com OR site:livenation.com)"
     : "";
 
   const hasTicketsWord = /\bticket(s)?\b/i.test(query);
@@ -64,104 +63,129 @@ async function webSearch(query, location, { preferTickets = true } = {}) {
       "X-API-KEY": process.env.SERPER_API_KEY,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ q: qFinal, num: 5 }),
+    body: JSON.stringify({ q: qFinal, num: 8 }),
   });
   if (!resp.ok) throw new Error(await resp.text());
   const data = await resp.json();
 
   const items = (data.organic || []).map((r, i) => ({
     n: i + 1,
-    title: r.title,
-    link: r.link,
-    snippet: r.snippet,
+    title: r.title || "",
+    link: r.link || "",
+    snippet: r.snippet || "",
   }));
   return items;
 }
 
-// --- Extract/format helpers (no links, clean bullets, summary) ---
-const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/i;
-const DATE_RE  = /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?[a-z]*\s*\d{1,2}(?:,\s*\d{4})?(?:\s*•?\s*\d{1,2}:\d{2}\s*(?:AM|PM))?/i;
+/* ============================================================
+   SMART PRICE EXTRACTION (trust-weighted & “starting at” first)
+   ============================================================ */
 
-function firstMatch(re, text) {
-  const m = (text || "").match(re);
-  return m ? m[0] : null;
+const TRUST = {
+  "vividseats.com": 3,
+  "ticketmaster.com": 3,
+  "seatgeek.com": 2.5,
+  "stubhub.com": 2.5,
+  "axs.com": 2.5,
+  "livenation.com": 2.5,
+};
+
+const BAD_PHRASES = /(parking|average historical price|cheapest day|vip packages?)/i;
+
+function getDomain(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; }
 }
-function clean(s) {
-  return (s || "").replace(/\s+/g, " ").trim();
-}
-// Drop irrelevant items (e.g., parking pages)
-function isIrrelevant(item) {
-  const t = `${item.title} ${item.snippet}`.toLowerCase();
-  return /parking|hotel|restaurant|faq|blog/.test(t);
-}
-// Normalize one search card into “Artist @ Venue (Date): Starting at $XX”
-function normalizeCompact(item) {
-  const title = clean(item.title);
-  const snip  = clean(item.snippet);
 
-  const price = firstMatch(PRICE_RE, `${title} ${snip}`);     // "$37"
-  const date  = firstMatch(DATE_RE,  `${title} ${snip}`);     // "Tue Aug 26 • 7:30PM"
+// prefer “From/Starting at $X”; fall back to bare $X; trust-weight results
+function extractPriceCandidates(items, focusText = "") {
+  const want = (focusText || "").toLowerCase();
+  const mustWords = want.split(/[^a-z0-9]+/i).filter(w => w.length > 2);
 
-  let artist  = title.split(" - ")[0] || title;
-  if (/^(Concerts|Tickets|Live|Events|Sports)/i.test(artist)) {
-    const m = snip.match(/^[A-Z][A-Za-z0-9 .&'’-]+/);
-    if (m) artist = m[0];
-  }
+  const reStrong = /(from|starting at)\s*\$([0-9]{2,4})/i;
+  const reAnyDollar = /\$\s*([0-9]{2,4})/g;
 
-  let venue = null;
-  if (snip) {
-    const parts = snip.split(". ");
-    const vSeg = parts.find((p) =>
-      /(Amphitheatre|Amphitheater|Center|Centre|Arena|Theatre|Theater|Stadium|Field|Park|Hall|Ballpark)/i.test(p)
-    );
-    if (vSeg) venue = vSeg.replace(/^From \$\d+.*/i, "");
-  }
+  const out = [];
+  for (const r of items || []) {
+    const dom = getDomain(r.link);
+    const hay = `${r.title} ${r.snippet}`;
 
-  const line =
-    `${clean(artist)}${venue ? " @ " + clean(venue) : ""}` +
-    `${date ? " (" + clean(date) + ")" : ""}` +
-    `${price ? `: Starting at ${price}` : ""}`;
+    if (BAD_PHRASES.test(hay)) continue;
 
-  return {
-    line: clean(line),
-    priceNumber: price ? parseInt(price.replace(/\D/g, ""), 10) : null
-  };
-}
-function compactList(items, max = 5) {
-  const filtered = (items || []).filter((it) => !isIrrelevant(it)).slice(0, max);
-  const normalized = filtered.map(normalizeCompact).filter(x => x.line);
-  return normalized;
-}
-function lowestStartingPriceFromRaw(items) {
-  let best = null;
-  for (const it of items || []) {
-    const m = (it.title + " " + it.snippet).match(/\$[ ]?(\d{2,4})/);
-    if (m) {
+    const okWords = mustWords.length ? mustWords.every(w => hay.toLowerCase().includes(w)) : true;
+    if (!okWords) continue;
+
+    const strong = hay.match(reStrong);
+    if (strong) {
+      const val = parseInt(strong[2], 10);
+      if (!isNaN(val) && val >= 20) out.push({ price: val, dom, strict: true, r });
+      continue;
+    }
+    let m;
+    while ((m = reAnyDollar.exec(hay))) {
       const val = parseInt(m[1], 10);
-      if (!isNaN(val) && val >= 20) best = best == null ? val : Math.min(best, val);
+      if (!isNaN(val) && val >= 20) out.push({ price: val, dom, strict: false, r });
     }
   }
-  return best ? `$${best}` : null;
-}
-function buildSearchMessage(items) {
-  const lowest = lowestStartingPriceFromRaw(items);
-  const summary = lowest
-    ? `Summary: Lowest starting price around ${lowest}.`
-    : `Summary: Here are a few options.`;
 
-  //  Only the summary + the CTA — no bullets.
+  for (const c of out) {
+    c.score = (TRUST[c.dom] || 1) * (c.strict ? 2 : 1) * (1 / (c.price || 1));
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out;
+}
+
+async function smartWebPriceSearch(userQ) {
+  const baseQ = (userQ || "").replace(/\b(prices?|cost|how much|starting at)\b/ig, "").trim();
+
+  // Try trusted sites first
+  const siteBatches = [
+    "site:vividseats.com",
+    "site:ticketmaster.com",
+    "site:seatgeek.com OR site:stubhub.com",
+    "site:axs.com OR site:livenation.com",
+  ];
+
+  for (const sites of siteBatches) {
+    const q = `${baseQ} tickets ${sites}`;
+    const items = await webSearch(q, null, { preferTickets: false });
+    const candidates = extractPriceCandidates(items, baseQ);
+    if (candidates.length) return { items, candidates };
+  }
+
+  // Fallback: general
+  const items = await webSearch(baseQ, null, { preferTickets: true });
+  const candidates = extractPriceCandidates(items, baseQ);
+  return { items, candidates };
+}
+
+// summary-only response (no bullets/links)
+function buildSummaryMessage(lowestPriceText) {
+  const summary = lowestPriceText
+    ? `Summary: Lowest starting price around ${lowestPriceText}.`
+    : `Summary: I couldn’t confirm a current starting price just yet.`;
   return `${summary}\n\nWould you like me to open the request form?`;
 }
 
-
-// --- “Popular shows in Chicago” suggestion path ---
+/* -------------------------------------------
+   Chicago suggestions (bias to Explore page)
+   ------------------------------------------- */
 async function suggestChicago() {
-  // Prefer the Vivid Explore page in Google results
-  const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true });
-  return buildSearchMessage(items);
+  // Heavily bias to Vivid’s Explore Chicago page
+  const items = await webSearch(
+    "popular shows Chicago site:vividseats.com/explore?location=chicago%2C+il",
+    "Chicago IL",
+    { preferTickets: true }
+  );
+  // We still reply with a summary (you asked to avoid bullets/links)
+  // If you want a list later, we can add a separate formatter.
+  const { candidates } = await smartWebPriceSearch("Chicago concerts");
+  const lowest = candidates.length ? `$${candidates[0].price}` : null;
+  return buildSummaryMessage(lowest);
 }
 
-// ---------- OpenAI ----------
+/* -----------------
+     OpenAI call
+   ----------------- */
 async function callOpenAI(messages) {
   const sysPrompt = `
 You are FTE's intake assistant. You can (1) collect ticket request details and save them,
@@ -236,7 +260,9 @@ Keep replies short & friendly. Fields for capture:
   return resp.json();
 }
 
-// ---------- Responses API helpers ----------
+/* -----------------------------
+   Responses API small helpers
+   ----------------------------- */
 function digToolCalls(x) {
   if (!x) return [];
   if (Array.isArray(x)) return x.flatMap(digToolCalls);
@@ -258,7 +284,9 @@ function toText(nodes) {
   return "";
 }
 
-// ---------- Tiny intent / confirmation helpers ----------
+/* --------------------------------------------
+   Tiny intent / confirmation helpers (same)
+   -------------------------------------------- */
 function looksLikeSearch(msg) {
   const q = (msg || "").toLowerCase();
   return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game|popular|upcoming|suggest|recommend/.test(q);
@@ -276,7 +304,9 @@ function userConfirmedPurchase(text) {
   return /\b(yes|yeah|yep|sure|submit|buy|purchase|book|go ahead|let'?s do it|looks good)\b/i.test(text || "");
 }
 
-// ---------- Azure Function entry ----------
+/* ----------------------------
+      Azure Function entry
+   ---------------------------- */
 module.exports = async function (context, req) {
   context.res = {
     headers: {
@@ -297,7 +327,7 @@ module.exports = async function (context, req) {
   }
 
   try {
-    // --- Support direct form capture from Framer (your RequestForm) ---
+    // Support direct form capture from Framer (RequestForm)
     if (req.body?.direct_capture && req.body?.capture) {
       await appendToSheet(toRow(req.body.capture));
       context.res.status = 200;
@@ -309,19 +339,19 @@ module.exports = async function (context, req) {
     const lastUser =
       [...messages].reverse().find((m) => m.role === "user")?.content || "";
 
-    // If user said "yes/submit/buy", instruct UI to open the form.
+    // User confirmed purchase → open form in UI
     if (userConfirmedPurchase(lastUser)) {
       context.res.status = 200;
       context.res.body = {
         message: "Great — opening the request form…",
-        openForm: true, // <-- Framer only opens modal if this flag is present
+        openForm: true,
       };
       return;
     }
 
-    // Quick path: user asked for suggestions (esp. Chicago)
+    // Quick path: suggestions in Chicago
     if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
-      const msg = await suggestChicago(); // formats bullets, no links
+      const msg = await suggestChicago(); // summary-only
       context.res.status = 200;
       context.res.body = { message: msg, results: [] };
       return;
@@ -334,7 +364,7 @@ module.exports = async function (context, req) {
 
     let captured = null;
 
-    // If the model asked for any tools, run them and answer
+    // Tool handling
     for (const c of calls) {
       const args =
         typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
@@ -352,28 +382,27 @@ module.exports = async function (context, req) {
       }
 
       if (c.name === "web_search") {
-        const results = await webSearch(args.q, args.location, { preferTickets: true });
-        const msg = buildSearchMessage(results); // summary + clean bullets (no links)
+        const q = (args?.q || "").trim();
+        const { candidates } = await smartWebPriceSearch(q);
+        const lowest = candidates.length ? `$${candidates[0].price}` : null;
+
         context.res.status = 200;
-        context.res.body = { message: msg, results };
+        context.res.body = { message: buildSummaryMessage(lowest) };
         return;
       }
     }
 
-    // Fallback: no tool calls but the user clearly asked for search/price/suggestions
+    // Fallback: no tool calls but looks like search/price → do our own
     if (looksLikeSearch(lastUser)) {
-      // If asking price-like, keep same query; bias to Vivid Seats
-      const q = looksLikePrice(lastUser)
-        ? `${lastUser} site:vividseats.com`
-        : lastUser;
-      const results = await webSearch(q, /*location*/ null, { preferTickets: true });
-      const msg = buildSearchMessage(results); // summary + bullets (no links)
+      const { candidates } = await smartWebPriceSearch(lastUser);
+      const lowest = candidates.length ? `$${candidates[0].price}` : null;
+
       context.res.status = 200;
-      context.res.body = { message: msg, results, note: "fallback_search" };
+      context.res.body = { message: buildSummaryMessage(lowest), note: "fallback_search" };
       return;
     }
 
-    // No tools and not a searchy message → plain assistant text
+    // Plain assistant text
     const assistantText =
       toText(data?.output ?? data?.content ?? []) || "Got it!";
     context.res.status = 200;
@@ -384,6 +413,7 @@ module.exports = async function (context, req) {
     context.res.body = { error: String(e) };
   }
 };
+
 
 
 // const { google } = require("googleapis");
