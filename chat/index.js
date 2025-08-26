@@ -129,12 +129,12 @@ You are FTE’s intake assistant on a public website. Your job is to help the us
 
 Conversation policy:
 - Start with a short, cheerful greeting.
-- Ask one short question at a time, only for fields that are missing.
+- Ask ONE short question at a time, only for fields that are missing.
 - If the user is browsing/undecided, you can search for events or provide starting prices when asked.
-- Keep replies concise; use plain language; avoid long lists unless requested.
-- When you have enough to create a ticket request, summarize the details and ask for a quick “yes” to confirm.
-- After confirmation, call the "capture_ticket_request" tool with the fields below.
-- Do not open or mention any external forms; the website handles that separately.
+- Keep replies concise; plain language; avoid long lists unless requested.
+- When you have enough details to create a request, summarize briefly and ask “Is this correct?”.
+- **If the user confirms, immediately CALL the "capture_ticket_request" tool** with the fields below. **Do NOT ask them to fill a form unless they explicitly ask for a form.**
+- The website handles opening a separate form when the user explicitly asks for it.
 - Do not ask for City/Residence.
 
 Fields to capture:
@@ -246,7 +246,12 @@ function looksLikeSearch(msg) {
 function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
 function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
 function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
-function userConfirmedPurchase(text) { return /\b(yes|yeah|yep|sure|submit|buy|purchase|book|go ahead|let'?s do it|looks good)\b/i.test(text || ""); }
+function userConfirmedPurchase(text) { return /\b(yes|yeah|yep|sure|sounds good|looks good|correct|that’s right|go ahead|confirm|book it)\b/i.test(text || ""); }
+
+// NEW: only open the manual form if the user clearly asks for it
+function wantsManualForm(text) {
+  return /\b(open|use|show)\b.*\b(form)\b|\bmanual(ly)?\b.*\b(form|request)\b|\bfill (out )?the form\b/i.test(text || "");
+}
 
 /* =====================  Azure Function entry  ===================== */
 module.exports = async function (context, req) {
@@ -273,22 +278,15 @@ module.exports = async function (context, req) {
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
 
-    // Explicit “yes/submit/buy” → instruct UI to open the form modal
-    if (userConfirmedPurchase(lastUser)) {
+    // If the user EXPLICITLY asks for the manual form → open it
+    if (wantsManualForm(lastUser)) {
       context.res.status = 200;
-      context.res.body = { message: "Great — opening the request form…", openForm: true };
+      context.res.body = { message: "Sure — opening the request form…", openForm: true };
       return;
     }
 
-    // Quick path: “suggestions in Chicago”
-    if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
-      const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true, max: 5 });
-      const best = minPriceAcross(items);
-      const msg = priceSummaryMessage(best);
-      context.res.status = 200;
-      context.res.body = { message: msg, results: [] };
-      return;
-    }
+    // NOTE: We no longer open the form just because the user said “yes”.
+    // That confirmation should make the model call capture_ticket_request.
 
     // Model pass
     const data = await callOpenAI(messages);
