@@ -28,25 +28,43 @@ async function appendToSheet(row) {
   });
 }
 
+/**
+ * Finalized row that BOTH the chat flow and the manual form write to.
+ * Columns (A..I):
+ *  A Timestamp
+ *  B Artist_or_event
+ *  C Ticket_qty
+ *  D Budget_tier
+ *  E Date_or_date_range
+ *  F Name
+ *  G Email
+ *  H Phone
+ *  I Notes
+ */
 function toRow(c) {
-  const timestamp = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" }); // A
-  const artistOrEvent = c?.artist_or_event || "";                                        // B
-  const qty = Number.isFinite(c?.ticket_qty) ? c.ticket_qty : parseInt(c?.ticket_qty || "", 10) || ""; // C
-  const name = c?.name || "";                                                            // D
-  const email = c?.email || "";                                                          // E
-  const phone = c?.phone || "";                                                          // F
-  const residence = c?.city_or_residence || c?.city || "";                               // G
-  const budget = c?.budget || "";                                                        // H
-  const notes = c?.notes || "";                                                          // I
-  return [timestamp, artistOrEvent, qty, name, email, phone, residence, budget, notes];
+  const ts = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" }); // A
+  const artist = c?.artist_or_event || "";                                        // B
+  const qty = Number.isFinite(c?.ticket_qty)
+    ? c.ticket_qty
+    : (parseInt(c?.ticket_qty || "", 10) || "");                                  // C
+  const budgetTier = c?.budget_tier || c?.budget || "";                           // D (accepts old 'budget' too)
+  const dateRange = c?.date_or_date_range || "";                                  // E
+  const name = c?.name || "";                                                     // F
+  const email = c?.email || "";                                                   // G
+  const phone = c?.phone || "";                                                   // H
+  const notes = c?.notes || "";                                                   // I
+
+  return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
 }
+
 
 /* =====================  Serper Search  ===================== */
 async function webSearch(query, location, { preferTickets = true, max = 5 } = {}) {
-  // Bias queries toward tickets sites (cleaner snippets with prices)
+  // Bias queries toward ticket sites (cleaner snippets with prices)
   const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com)" : "";
   const hasTicketsWord = /\bticket(s)?\b/i.test(query);
-  const qFinal = query + (hasTicketsWord ? "" : " tickets") + (location ? ` ${location}` : "") + siteBias;
+  const qFinal =
+    query + (hasTicketsWord ? "" : " tickets") + (location ? ` ${location}` : "") + siteBias;
 
   const resp = await fetch("https://google.serper.dev/search", {
     method: "POST",
@@ -66,9 +84,6 @@ async function webSearch(query, location, { preferTickets = true, max = 5 } = {}
 
 /* =====================  Price / Formatting helpers  ===================== */
 const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi;
-const DATE_RE  = /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?[a-z]*\s*\d{1,2}(?:,\s*\d{4})?(?:\s*•?\s*\d{1,2}:\d{2}\s*(?:AM|PM))?/i;
-
-const isParking = (s) => /parking/i.test(s || "");
 const irrelevant = (t, s) => /parking|hotel|restaurant|faq|blog/i.test(`${t} ${s}`);
 
 function firstPrice(text) {
@@ -89,11 +104,10 @@ function minPriceAcross(items) {
   return best;
 }
 
-/** Try to grab the first non-parking Vivid Seats price for (artist, city). */
-async function vividStartingPrice(artist, city) {
-  const q = `${artist} ${city ? city + " " : ""}tickets site:vividseats.com`;
-  const items = await webSearch(q, null, { preferTickets: true, max: 5 });
-  const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !isParking(it.link) && !irrelevant(it.title, it.snippet));
+/** Try to grab the first Vivid Seats price for (query). */
+async function vividStartingPrice(q) {
+  const items = await webSearch(`${q} tickets site:vividseats.com`, null, { preferTickets: true, max: 5 });
+  const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !irrelevant(it.title, it.snippet));
   const first = vividOnly[0];
   if (!first) return null;
   const p = firstPrice(`${first.title} ${first.snippet}`);
@@ -111,23 +125,29 @@ function priceSummaryMessage(priceNum) {
 /* =====================  OpenAI  ===================== */
 async function callOpenAI(messages) {
   const sysPrompt = `
-You are FTE’s intake assistant for tickets. Your goals:
-1) If the user is deciding or asks about shows, prices, availability, dates or venues → SEARCH first (use the web_search tool).
-2) If the user wants to proceed → confirm and the website will open a form to collect contact details. Do NOT collect personal info in chat.
-3) Keep replies short, friendly, and proactive. Ask only the next missing detail to complete a request.
+You are FTE’s intake assistant on a public website. Your job is to help the user get tickets in a friendly, efficient way.
 
-Dialog policy (enforced):
-- If event/artist missing → ask: “Which artist or event (and city)?”
-- If artist present and qty missing → ask: “How many tickets?”
-- If qty present and city/date missing → ask for city and rough date (“when/where?”).
-- If those present and budget missing → ask: “What’s your rough budget per ticket?”
-- If user confirms proceed → say you’ll open the form (the UI handles it).
-- For price questions → search; return just a concise summary of the lowest starting price you can find.
-- Never ask for name/email/phone in chat. Those go into the form only.
+Conversation policy:
+- Start with a short, cheerful greeting.
+- Ask one short question at a time, only for fields that are missing.
+- If the user is browsing/undecided, you can search for events or provide starting prices when asked.
+- Keep replies concise; use plain language; avoid long lists unless requested.
+- When you have enough to create a ticket request, summarize the details and ask for a quick “yes” to confirm.
+- After confirmation, call the "capture_ticket_request" tool with the fields below.
+- Do not open or mention any external forms; the website handles that separately.
+- Do not ask for City/Residence.
 
-Fields when we finally capture:
-artist_or_event (string), ticket_qty (integer), city_or_residence (string),
-date_or_date_range (string), budget (string), notes (string).
+Fields to capture:
+- artist_or_event (string, required)
+- ticket_qty (integer, required)
+- budget_tier (string, one of: "<$50","$50–$99","$100–$149","$150–$199","$200–$249","$250–$299","$300–$349","$350–$399","$400–$499","$500+")
+- date_or_date_range (string, optional)
+- name (string, required)
+- email (string, required)
+- phone (string, optional)
+- notes (string, optional, 1–2 short sentences)
+
+When the user asks about prices or “what’s on”, you may call "web_search" first and reply with a short summary (e.g., “Lowest starting price around $X”). Avoid bullets/links unless the user asks.
 `;
 
   const body = {
@@ -144,12 +164,21 @@ date_or_date_range (string), budget (string), notes (string).
           properties: {
             artist_or_event: { type: "string" },
             ticket_qty: { type: "integer" },
-            city_or_residence: { type: "string" },
+            budget_tier: {
+              type: "string",
+              enum: [
+                "<$50","$50–$99","$100–$149","$150–$199",
+                "$200–$249","$250–$299","$300–$349","$350–$399",
+                "$400–$499","$500+"
+              ]
+            },
             date_or_date_range: { type: "string" },
-            budget: { type: "string" },
+            name: { type: "string" },
+            email: { type: "string" },
+            phone: { type: "string" },
             notes: { type: "string" }
           },
-          required: ["artist_or_event", "ticket_qty"]
+          required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
         }
       },
       {
@@ -193,28 +222,17 @@ function digToolCalls(x) {
   return out;
 }
 
-/** Extracts assistant reply from Responses API safely. */
 function toAssistantText(obj) {
-  // Common places the text can live:
-  const tryList = [
-    obj?.output_text,               // new field sometimes present
-    obj?.text,                      // root text
-    obj?.content,                   // may be array or string
-    obj?.output                     // nested nodes
-  ];
-
-  const flatten = (node) => {
+  const tryList = [obj?.output_text, obj?.text, obj?.content, obj?.output];
+  const flat = (node) => {
     if (!node) return "";
     if (typeof node === "string") return node;
-    if (Array.isArray(node)) return node.map(flatten).join("");
-    if (typeof node === "object") {
-      return [node.text, node.content, node.output].map(flatten).join("");
-    }
+    if (Array.isArray(node)) return node.map(flat).join("");
+    if (typeof node === "object") return [node.text, node.content, node.output].map(flat).join("");
     return "";
   };
-
   for (const cand of tryList) {
-    const s = flatten(cand).trim();
+    const s = flat(cand).trim();
     if (s) return s;
   }
   return "";
@@ -244,7 +262,7 @@ module.exports = async function (context, req) {
   if (req.method !== "POST") { context.res.status = 405; context.res.body = { error: "Method not allowed" }; return; }
 
   try {
-    // Direct form capture from Framer RequestForm
+    // Direct form capture from Framer RequestForm (manual modal)
     if (req.body?.direct_capture && req.body?.capture) {
       await appendToSheet(toRow(req.body.capture));
       context.res.status = 200;
@@ -255,7 +273,7 @@ module.exports = async function (context, req) {
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
 
-    // Explicit “yes/submit/buy” → instruct UI to open the form
+    // Explicit “yes/submit/buy” → instruct UI to open the form modal
     if (userConfirmedPurchase(lastUser)) {
       context.res.status = 200;
       context.res.body = { message: "Great — opening the request form…", openForm: true };
@@ -292,13 +310,10 @@ module.exports = async function (context, req) {
       }
 
       if (c.name === "web_search") {
-        // If it looks like a price query, attempt a vivid-first price
+        // If looks like a price query, try vivid first; else fallback to general min
         let bestNum = null;
         if (looksLikePrice(args.q)) {
-          // Try to infer artist & city from the query text (simple heuristic)
-          const artist = args.q.replace(/(price|prices|ticket|tickets|how much)/gi, "").trim();
-          const cityMatch = args.location || (artist.match(/\b(chicago|tinley park|rosemont|detroit|milwaukee|madison|indianapolis)\b/i) || [])[0];
-          bestNum = await vividStartingPrice(artist, cityMatch || "");
+          bestNum = await vividStartingPrice(args.q);
         }
         if (bestNum == null) {
           const results = await webSearch(args.q, args.location, { preferTickets: true });
@@ -314,10 +329,9 @@ module.exports = async function (context, req) {
 
     // Fallback: user asked a search/price question but model didn’t call tools
     if (looksLikeSearch(lastUser)) {
-      // Price-leaning fallback: bias to Vivid Seats
       let bestNum = null;
       if (looksLikePrice(lastUser)) {
-        bestNum = await vividStartingPrice(lastUser, "");
+        bestNum = await vividStartingPrice(lastUser);
       }
       if (bestNum == null) {
         const results = await webSearch(lastUser, null, { preferTickets: true });
@@ -333,7 +347,7 @@ module.exports = async function (context, req) {
     let assistantText = toAssistantText(data);
     if (!assistantText) {
       // Helpful follow-up instead of “Got it!”
-      assistantText = "Got it. How many tickets are you looking for, and what’s your rough budget per ticket?";
+      assistantText = "Got it. Which artist or event are you looking for, and how many tickets do you need?";
     }
     context.res.status = 200;
     context.res.body = { message: assistantText, captured: null };
