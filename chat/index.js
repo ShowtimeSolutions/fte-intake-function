@@ -29,7 +29,7 @@ async function appendToSheet(row) {
 }
 
 /**
- * Finalized row that BOTH the chat flow and the manual form write to.
+ * Finalized row (shared by chat + manual form)
  * Columns (A..I):
  *  A Timestamp
  *  B Artist_or_event
@@ -53,7 +53,6 @@ function toRow(c) {
   const email = c?.email || "";                                                   // G
   const phone = c?.phone || "";                                                   // H
   const notes = c?.notes || "";                                                   // I
-
   return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
 }
 
@@ -80,9 +79,9 @@ async function webSearch(query, location, { preferTickets = true, max = 5 } = {}
   }));
 }
 
-/* =====================  Price / Formatting helpers  ===================== */
+/* =====================  Price helpers  ===================== */
 const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi;
-const IRRELEVANT = (t, s) => /parking|hotel|restaurant|faq|blog/i.test(`${t} ${s}`);
+const irrelevant = (t, s) => /parking|hotel|restaurant|faq|blog/i.test(`${t} ${s}`);
 
 function firstPrice(text) {
   if (!text) return null;
@@ -104,7 +103,7 @@ function minPriceAcross(items) {
 
 async function vividStartingPrice(q) {
   const items = await webSearch(`${q} tickets site:vividseats.com`, null, { preferTickets: true, max: 5 });
-  const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !IRRELEVANT(it.title, it.snippet));
+  const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !irrelevant(it.title, it.snippet));
   const first = vividOnly[0];
   if (!first) return null;
   const p = firstPrice(`${first.title} ${first.snippet}`);
@@ -118,22 +117,59 @@ function priceSummaryMessage(priceNum) {
   return `Summary: I couldn’t confirm a current starting price just yet.` + `\n\nWould you like me to open the request form?`;
 }
 
+/* =====================  Budget helpers  ===================== */
+const BUDGET_ENUM = [
+  "<$50","$50–$99","$100–$149","$150–$199",
+  "$200–$249","$250–$299","$300–$349","$350–$399",
+  "$400–$499","$500+"
+];
+function mapBudgetToTier(text) {
+  if (!text) return "";
+  const t = String(text).toLowerCase();
+
+  // Direct range mention
+  for (const tier of BUDGET_ENUM) {
+    const plain = tier.replace("–", "-");
+    const re = new RegExp(plain.replace("$","\\$").replace("+","\\+"), "i");
+    if (re.test(t)) return tier;
+  }
+
+  // "around 100", "~120", "about $140"
+  const m = t.match(/\$?\s?(\d{2,4})/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (!isNaN(n)) {
+      if (n < 50) return "<$50";
+      if (n < 100) return "$50–$99";
+      if (n < 150) return "$100–$149";
+      if (n < 200) return "$150–$199";
+      if (n < 250) return "$200–$249";
+      if (n < 300) return "$250–$299";
+      if (n < 350) return "$300–$349";
+      if (n < 400) return "$350–$399";
+      if (n < 500) return "$400–$499";
+      return "$500+";
+    }
+  }
+  return "";
+}
+
 /* =====================  OpenAI  ===================== */
-function baseSystemPrompt() {
-  return `
-You are FTE’s intake assistant on a public website. Your job is to help the user get tickets in a friendly, efficient way.
+async function callOpenAI(messages) {
+  const sysPrompt = `
+You are FTE’s intake assistant on a public website.
+
+**Critical rule:** When all required fields are present, DO NOT stall or say “almost there”.
+Immediately call the tool \`capture_ticket_request\` with the fields. Be decisive.
 
 Conversation policy:
-- Start with a short, cheerful greeting.
-- Ask ONE short question at a time for missing fields.
-- If the user is browsing/undecided, you may search for events or provide starting prices when asked.
-- Keep replies concise; plain language.
-- When you have enough to create a ticket request, provide a one-sentence summary and ask for a quick **yes** to confirm.
-- AFTER the user confirms, you MUST call the "capture_ticket_request" tool with the collected fields.
-- ONLY open the manual form if the user explicitly asks you to open the form; otherwise finalize via "capture_ticket_request".
-- Do not ask for City/Residence.
+- Start friendly and keep replies short.
+- Ask one missing detail at a time (artist/event, qty, budget tier, date, name, email; phone/notes optional).
+- Accept combined answers like "Nick Lynch, nick@example.com".
+- If asked about prices/what’s on, you may call \`web_search\` and reply with a brief summary (no links).
+- Never ask for City/Residence.
 
-Fields to capture (for capture_ticket_request):
+Fields to capture:
 - artist_or_event (string, required)
 - ticket_qty (integer, required)
 - budget_tier (string, one of: "<$50","$50–$99","$100–$149","$150–$199","$200–$249","$250–$299","$300–$349","$350–$399","$400–$499","$500+")
@@ -142,42 +178,12 @@ Fields to capture (for capture_ticket_request):
 - email (string, required)
 - phone (string, optional)
 - notes (string, optional, 1–2 short sentences)
-
-When the user asks about prices or “what’s on”, you may call "web_search" first and reply with a short summary (e.g., “Lowest starting price around $X”). Avoid bullets/links unless the user asks.
-
----
-
-FEW-SHOT DIALOG EXAMPLES (style & flow)
-
-[Example 1 — collect then capture]
-User: "I want Jonas Brothers tickets"
-Assistant: "Great choice! How many tickets do you need?"
-User: "4"
-Assistant: "What budget range per ticket? (e.g. $50–$99, $100–$149)"
-User: "$100–$149"
-Assistant: "Any preferred date or date range?"
-User: "Aug 26"
-Assistant: "Got it. What's the name and email to place the request?"
-User: "Nick — nick@example.com"
-Assistant: "Thanks! Summary: 4 Jonas Brothers tickets on Aug 26, budget $100–$149, under Nick (nick@example.com). Is that correct?"
-User: "Yes"
-Assistant: [CALL capture_ticket_request with the fields]
-
-[Example 2 — price lookup then proceed]
-User: "How much are Jonas Brothers tickets in Tinley Park?"
-Assistant: [CALL web_search]
-Assistant: "Summary: Lowest starting price around $38. Want to proceed with a request?"
-User: "Yes"
-Assistant: "How many tickets do you need?"
-(continue asking one missing field at a time, then call capture_ticket_request)
 `;
-}
 
-async function callOpenAI(messages) {
   const body = {
     model: "gpt-4.1-mini",
     temperature: 0.2,
-    input: [{ role: "system", content: baseSystemPrompt() }, ...messages],
+    input: [{ role: "system", content: sysPrompt }, ...messages],
     tools: [
       {
         type: "function",
@@ -188,14 +194,7 @@ async function callOpenAI(messages) {
           properties: {
             artist_or_event: { type: "string" },
             ticket_qty: { type: "integer" },
-            budget_tier: {
-              type: "string",
-              enum: [
-                "<$50","$50–$99","$100–$149","$150–$199",
-                "$200–$249","$250–$299","$300–$349","$350–$399",
-                "$400–$499","$500+"
-              ]
-            },
+            budget_tier: { type: "string", enum: BUDGET_ENUM },
             date_or_date_range: { type: "string" },
             name: { type: "string" },
             email: { type: "string" },
@@ -235,63 +234,6 @@ async function callOpenAI(messages) {
   return resp.json();
 }
 
-/** Force-finalization pass: after user says “yes”, compel the model to call capture_ticket_request. */
-async function callOpenAIFinalize(messages) {
-  const finalizeSystem = `
-You must now finalize the ticket request based on the conversation so far.
-- If all required fields are present (artist_or_event, ticket_qty, budget_tier, name, email), CALL "capture_ticket_request".
-- If exactly one required field is missing, ask ONE short question for that field and stop.
-- Do NOT re-start the conversation; do NOT ask for fields already provided.
-- Do NOT open the manual form. Use capture_ticket_request.
-`;
-  const body = {
-    model: "gpt-4.1-mini",
-    temperature: 0.1,
-    input: [{ role: "system", content: finalizeSystem }, ...messages],
-    tools: [
-      {
-        type: "function",
-        name: "capture_ticket_request",
-        description: "Finalize a ticket request and log to Google Sheets.",
-        parameters: {
-          type: "object",
-          properties: {
-            artist_or_event: { type: "string" },
-            ticket_qty: { type: "integer" },
-            budget_tier: {
-              type: "string",
-              enum: [
-                "<$50","$50–$99","$100–$149","$150–$199",
-                "$200–$249","$250–$299","$300–$349","$350–$399",
-                "$400–$499","$500+"
-              ]
-            },
-            date_or_date_range: { type: "string" },
-            name: { type: "string" },
-            email: { type: "string" },
-            phone: { type: "string" },
-            notes: { type: "string" }
-          },
-          required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
-        }
-      }
-    ],
-    tool_choice: "auto"
-  };
-
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
-
-  if (!resp.ok) throw new Error(await resp.text());
-  return resp.json();
-}
-
 /* =====================  Responses helpers  ===================== */
 function digToolCalls(x) {
   if (!x) return [];
@@ -302,7 +244,6 @@ function digToolCalls(x) {
   if (x.content) out.push(...digToolCalls(x.content));
   return out;
 }
-
 function toAssistantText(obj) {
   const tryList = [obj?.output_text, obj?.text, obj?.content, obj?.output];
   const flat = (node) => {
@@ -319,7 +260,7 @@ function toAssistantText(obj) {
   return "";
 }
 
-/* =====================  Intent / Guard helpers  ===================== */
+/* =====================  Intent helpers  ===================== */
 function looksLikeSearch(msg) {
   const q = (msg || "").toLowerCase();
   return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game|popular|upcoming|suggest|recommend/.test(q);
@@ -327,12 +268,100 @@ function looksLikeSearch(msg) {
 function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
 function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
 function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
-function userConfirmedPurchase(text) { return /\b(yes|yeah|yep|sure|correct|that'?s right|looks good)\b/i.test(text || ""); }
+function userConfirmedPurchase(text) { return /\b(yes|yeah|yep|sure|submit|buy|purchase|book|go ahead|let'?s do it|looks good|confirm)\b/i.test(text || ""); }
 
-/** Did the previous assistant message look like a summary + confirmation prompt? */
-function assistantAskedToConfirm(msg) {
-  const s = (msg || "").toLowerCase();
-  return /summary|is that correct\??|does that look right\??|shall i proceed\??|confirm/i.test(s);
+/* =====================  Force-save helpers  ===================== */
+/** Find the most recent assistant "Summary:" message */
+function getLatestSummary(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "assistant" && /summary:/i.test(m.content || "")) {
+      return m.content;
+    }
+  }
+  return "";
+}
+
+/** Extract fields from our summary sentence formats */
+function parseFromSummary(text) {
+  if (!text) return null;
+
+  // Example:
+  // "Summary: 4 Jonas Brothers tickets for today, budget $100–$149, under Nick Lynch (nick@example.com). Is that correct?"
+  const out = {};
+
+  // qty + artist
+  const m1 = text.match(/summary:\s*(\d+)\s+(.+?)\s+tickets/i);
+  if (m1) {
+    out.ticket_qty = parseInt(m1[1], 10);
+    out.artist_or_event = m1[2].trim();
+  }
+
+  // date (optional) — look after "for ..."
+  const m2 = text.match(/\btickets\s+for\s+([^,\.]+)/i);
+  if (m2) out.date_or_date_range = m2[1].trim();
+
+  // budget tier
+  const m3 = text.match(/\bbudget\s+([$\d–\-+<> ]+)/i);
+  if (m3) out.budget_tier = mapBudgetToTier(m3[1]);
+
+  // name & email
+  const m4 = text.match(/\bunder\s+([^(\.]+)\s*\(([^)]+)\)/i);
+  if (m4) {
+    out.name = m4[1].trim();
+    out.email = m4[2].trim();
+  } else {
+    // sometimes name/email may be phrased differently
+    const email = (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [])[0];
+    if (email) out.email = email;
+  }
+
+  // If we got the required fields return it, else null
+  if (out.artist_or_event && Number.isFinite(out.ticket_qty) && out.budget_tier && out.name && out.email) {
+    return out;
+  }
+  return null;
+}
+
+/** Light scan of the whole transcript to enrich missing optional fields */
+function enrichOptionalFromTranscript(obj, messages) {
+  const transcript = messages.map(m => m.content || "").join("\n");
+  if (!obj.email) {
+    const e = (transcript.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [])[0];
+    if (e) obj.email = e;
+  }
+  if (!obj.phone) {
+    const p = (transcript.match(/\b(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/) || [])[0];
+    if (p) obj.phone = p;
+  }
+  if (!obj.notes) {
+    const lower = transcript.toLowerCase();
+    if (/aisle/.test(lower)) obj.notes = "Aisle seats";
+    else if (/wheelchair|ada/.test(lower)) obj.notes = "ADA/wheelchair";
+  }
+  return obj;
+}
+
+/** Try to force-save a captured request based on YES + latest summary */
+async function maybeForceSaveOnYes(messages, context) {
+  const lastUser = [...messages].reverse().find(m => m.role === "user")?.content || "";
+  if (!userConfirmedPurchase(lastUser)) return null;
+
+  const summary = getLatestSummary(messages);
+  if (!summary) return null;
+
+  let captured = parseFromSummary(summary);
+  if (!captured) return null;
+
+  captured = enrichOptionalFromTranscript(captured, messages);
+
+  await appendToSheet(toRow(captured));
+  context.res.status = 200;
+  context.res.body = {
+    message: "✅ Your request has been placed! We’ll follow up shortly.",
+    captured
+  };
+  return captured;
 }
 
 /* =====================  Azure Function entry  ===================== */
@@ -349,7 +378,7 @@ module.exports = async function (context, req) {
   if (req.method !== "POST") { context.res.status = 405; context.res.body = { error: "Method not allowed" }; return; }
 
   try {
-    // Direct manual form capture
+    // Manual form capture (Framer modal)
     if (req.body?.direct_capture && req.body?.capture) {
       await appendToSheet(toRow(req.body.capture));
       context.res.status = 200;
@@ -359,44 +388,12 @@ module.exports = async function (context, req) {
 
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
-    const prevAssistant = [...messages].reverse().find((m) => m.role === "assistant")?.content || "";
 
-    // If the user explicitly asks to open the form
-    if (/\b(open|show|fill|use)\b.*\b(form|request form)\b/i.test(lastUser)) {
-      context.res.status = 200;
-      context.res.body = { message: "Opening the request form…", openForm: true };
-      return;
-    }
+    // NEW: If user said "yes" after a Summary → force-save now (backend guarantee)
+    const forced = await maybeForceSaveOnYes(messages, context);
+    if (forced) return;
 
-    // If the previous assistant asked for confirmation and the user said YES,
-    // run a force-finalization pass that MUST call capture_ticket_request.
-    if (assistantAskedToConfirm(prevAssistant) && userConfirmedPurchase(lastUser)) {
-      const forced = await callOpenAIFinalize(messages);
-      const calls = digToolCalls(forced);
-
-      if (calls.length) {
-        for (const c of calls) {
-          const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
-          if (c.name === "capture_ticket_request") {
-            await appendToSheet(toRow(args));
-            context.res.status = 200;
-            context.res.body = {
-              message: "Thanks! I saved your request. We’ll follow up shortly to confirm details.",
-              captured: args
-            };
-            return;
-          }
-        }
-      }
-
-      // If the model still didn’t call the tool, reply with the assistant text (likely one missing field)
-      const forcedText = toAssistantText(forced) || "Almost there—what’s the last missing detail?";
-      context.res.status = 200;
-      context.res.body = { message: forcedText };
-      return;
-    }
-
-    // Quick path: “suggestions in Chicago”
+    // Suggestions (Chicago)
     if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
       const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true, max: 5 });
       const best = minPriceAcross(items);
@@ -406,19 +403,19 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // Normal model pass
+    // Model pass
     const data = await callOpenAI(messages);
     const calls = digToolCalls(data);
     context.log("Tool calls:", JSON.stringify(calls));
 
-    // Run any tool calls the model asked for
+    // Execute any tool calls requested by the model
     for (const c of calls) {
       const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
 
       if (c.name === "capture_ticket_request") {
         await appendToSheet(toRow(args));
         context.res.status = 200;
-        context.res.body = { message: "Thanks! I saved your request. We’ll follow up shortly to confirm details.", captured: args };
+        context.res.body = { message: "✅ Your request has been placed! We’ll follow up shortly.", captured: args };
         return;
       }
 
@@ -440,29 +437,7 @@ module.exports = async function (context, req) {
     if (looksLikeSearch(lastUser)) {
       let bestNum = null;
       if (looksLikePrice(lastUser)) bestNum = await vividStartingPrice(lastUser);
-      if (bestNum == null) {
-        const results = await webSearch(lastUser, null, { preferTickets: true });
-        bestNum = minPriceAcross(results);
-      }
-      const msg = priceSummaryMessage(bestNum);
-      context.res.status = 200;
-      context.res.body = { message: msg, note: "fallback_search" };
-      return;
-    }
 
-    // No tool calls and not a search → return assistant text (never empty)
-    let assistantText = toAssistantText(data);
-    if (!assistantText) {
-      assistantText = "Got it. Which artist or event are you looking for, and how many tickets do you need?";
-    }
-    context.res.status = 200;
-    context.res.body = { message: assistantText, captured: null };
-  } catch (e) {
-    context.log.error(e);
-    context.res.status = 500;
-    context.res.body = { error: String(e) };
-  }
-};
 
 
 
