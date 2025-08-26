@@ -46,19 +46,32 @@ function toRow(c) {
 }
 
 // ---------- Serper Web Search ----------
+const HAVE_SERPER = !!process.env.SERPER_API_KEY;
+
 async function webSearch(query, location) {
+  if (!HAVE_SERPER) {
+    console.error("[web_search] SERPER_API_KEY is missing");
+    throw new Error("SERPER_API_KEY is not set in Azure App Settings.");
+  }
+
+  const q = query + (location ? ` ${location}` : "");
+  console.log("[web_search] q=%s loc=%s", query, location || "");
+
   const resp = await fetch("https://google.serper.dev/search", {
     method: "POST",
     headers: {
       "X-API-KEY": process.env.SERPER_API_KEY,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      q: query + (location ? ` ${location}` : ""),
-      num: 5,
-    }),
+    body: JSON.stringify({ q, num: 5 }),
   });
-  if (!resp.ok) throw new Error(await resp.text());
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.error("[web_search] HTTP %s – %s", resp.status, text);
+    throw new Error(`Serper error ${resp.status}: ${text}`);
+  }
+
   const data = await resp.json();
 
   const items = (data.organic || []).map((r, i) => ({
@@ -67,6 +80,8 @@ async function webSearch(query, location) {
     link: r.link,
     snippet: r.snippet,
   }));
+
+  console.log("[web_search] found %d items", items.length);
   return items;
 }
 
@@ -97,7 +112,7 @@ function guessPriceFromResults(items) {
 }
 
 // ---------- OpenAI ----------
-async function callOpenAI(messages) {
+async function callOpenAI(messages, forceSearch = false) {
   const sysPrompt = `
 You are FTE's intake assistant. You can (1) collect ticket request details and save them,
 or (2) search the web for events/venues/dates when the user is still deciding.
@@ -152,9 +167,11 @@ Keep replies short & friendly. Fields for capture:
         },
       },
     ],
-    tool_choice: "auto",
+    // Step 3: temporarily force the search tool for debugging if it "looks" like a search query
+    tool_choice: forceSearch ? { type: "function", name: "web_search" } : "auto",
   };
 
+  console.log("[openai] tool_choice:", body.tool_choice);
   const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -173,7 +190,10 @@ function digToolCalls(x) {
   if (!x) return [];
   if (Array.isArray(x)) return x.flatMap(digToolCalls);
   const out = [];
-  if (x.type === "tool_call" && x.name) out.push(x);
+  if (x.type === "tool_call" && x.name) {
+    console.log("[tool_call]", x.name, x.arguments || "");
+    out.push(x);
+  }
   if (x.output) out.push(...digToolCalls(x.output));
   if (x.content) out.push(...digToolCalls(x.content));
   return out;
@@ -226,10 +246,14 @@ module.exports = async function (context, req) {
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
 
+    // Step 3: toggle this to true while debugging to *force* a search when the text looks searchy
+    const FORCE_SEARCH = looksLikeSearch(lastUser);
+    console.log("[entry] lastUser=%s | FORCE_SEARCH=%s", lastUser, FORCE_SEARCH);
+
     // First model pass
-    const data = await callOpenAI(messages);
+    const data = await callOpenAI(messages, FORCE_SEARCH);
     const calls = digToolCalls(data);
-    context.log("Tool calls detected:", JSON.stringify(calls));
+    console.log("[entry] tool calls detected:", JSON.stringify(calls));
 
     let captured = null;
 
@@ -251,7 +275,6 @@ module.exports = async function (context, req) {
 
       if (c.name === "web_search") {
         const results = await webSearch(args.q, args.location);
-        // Price hint (nice-to-have)
         const price = looksLikePrice(args.q) ? guessPriceFromResults(results) : null;
         const msg =
           price
@@ -265,7 +288,6 @@ module.exports = async function (context, req) {
 
     // ---- Fallback: no tool calls, but looks like search/price -> do it ourselves
     if (looksLikeSearch(lastUser)) {
-      // Prefer Vivid Seats when user asked price-ish questions
       const q = looksLikePrice(lastUser)
         ? `${lastUser} site:vividseats.com`
         : lastUser;
@@ -285,7 +307,7 @@ module.exports = async function (context, req) {
     context.res.status = 200;
     context.res.body = { message: assistantText, captured: null };
   } catch (e) {
-    context.log.error(e);
+    console.error(e);
     context.res.status = 500;
     context.res.body = { error: String(e) };
   }
