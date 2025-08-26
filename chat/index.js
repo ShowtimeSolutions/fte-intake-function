@@ -1,9 +1,5 @@
 // index.js — Azure Function (Node 18+)
 // -----------------------------------
-// Features:
-// 1) capture_ticket_request -> appends a row to Google Sheets
-// 2) web_search -> uses Serper to search the web and returns neat results
-
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
 
@@ -35,17 +31,17 @@ async function appendToSheet(row) {
 function toRow(c) {
   const timestamp = new Date().toLocaleString("en-US", {
     timeZone: "America/Chicago",
-  }); // A
-  const artistOrEvent = c?.artist_or_event || ""; // B
+  });
+  const artistOrEvent = c?.artist_or_event || "";
   const qty = Number.isFinite(c?.ticket_qty)
     ? c.ticket_qty
-    : parseInt(c?.ticket_qty || "", 10) || ""; // C
-  const name = c?.name || ""; // D
-  const email = c?.email || ""; // E
-  const phone = c?.phone || ""; // F
-  const residence = c?.city_or_residence || c?.city || ""; // G
-  const budget = c?.budget || ""; // H
-  const notes = c?.notes || ""; // I
+    : parseInt(c?.ticket_qty || "", 10) || "";
+  const name = c?.name || "";
+  const email = c?.email || "";
+  const phone = c?.phone || "";
+  const residence = c?.city_or_residence || c?.city || "";
+  const budget = c?.budget || "";
+  const notes = c?.notes || "";
   return [timestamp, artistOrEvent, qty, name, email, phone, residence, budget, notes];
 }
 
@@ -65,23 +61,39 @@ async function webSearch(query, location) {
   if (!resp.ok) throw new Error(await resp.text());
   const data = await resp.json();
 
-  // Keep it tight & readable for the chat
   const items = (data.organic || []).map((r, i) => ({
     n: i + 1,
     title: r.title,
     link: r.link,
     snippet: r.snippet,
   }));
-
   return items;
 }
 
 function formatSearchResults(items) {
-  if (!items?.length) return "I didn’t find anything useful.";
+  if (!items?.length) return "I didn’t find anything useful yet.";
   const lines = items.map(
     (r) => `• ${r.title}\n  ${r.snippet}\n  ${r.link}`
   );
   return `Here are a few options I found:\n\n${lines.join("\n\n")}`;
+}
+
+// --- Price helper: pull a plausible $ amount from snippets/titles ---
+function guessPriceFromResults(items) {
+  const priceRE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/g; // $150 or $150 - $300
+  let best = null;
+
+  for (const r of items || []) {
+    const hay = `${r.title} ${r.snippet}`;
+    let m;
+    while ((m = priceRE.exec(hay))) {
+      const val = parseInt(m[1], 10);
+      if (!isNaN(val) && val >= 20) {
+        if (!best || val < best) best = val; // take the lowest reasonable price
+      }
+    }
+  }
+  return best ? `$${best.toString()}` : null;
 }
 
 // ---------- OpenAI ----------
@@ -90,12 +102,14 @@ async function callOpenAI(messages) {
 You are FTE's intake assistant. You can (1) collect ticket request details and save them,
 or (2) search the web for events/venues/dates when the user is still deciding.
 
+When the user asks about events, shows, what's on, dates, venues, availability, or prices,
+you MUST call the web_search tool FIRST with a good query (include location if known).
+
 Tools you may call:
 - capture_ticket_request: when the user is ready to submit details.
-- web_search: when the user asks for ideas, dates, venues, or availability info.
+- web_search: when the user asks for ideas, dates, venues, availability, or prices.
 
-When searching, ask for location if missing. Keep replies short & friendly.
-Fields for capture:
+Keep replies short & friendly. Fields for capture:
   artist_or_event (string), ticket_qty (integer), name, email, phone,
   city_or_residence, budget, date_or_date_range, notes (1–2 sentences).
 `;
@@ -154,7 +168,7 @@ Fields for capture:
   return resp.json();
 }
 
-// Helpers to parse OpenAI Responses API
+// ---------- Helpers for Responses API ----------
 function digToolCalls(x) {
   if (!x) return [];
   if (Array.isArray(x)) return x.flatMap(digToolCalls);
@@ -175,6 +189,17 @@ function toText(nodes) {
     return [nodes.text, nodes.content, nodes.output].map(toText).join("");
   }
   return "";
+}
+
+// Small intent heuristic for fallback
+function looksLikeSearch(msg) {
+  const q = (msg || "").toLowerCase();
+  return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|sports|game/.test(
+    q
+  );
+}
+function looksLikePrice(msg) {
+  return /(price|prices|cost|how much)/i.test(msg || "");
 }
 
 // ---------- Azure Function entry ----------
@@ -199,10 +224,12 @@ module.exports = async function (context, req) {
 
   try {
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
 
     // First model pass
     const data = await callOpenAI(messages);
     const calls = digToolCalls(data);
+    context.log("Tool calls detected:", JSON.stringify(calls));
 
     let captured = null;
 
@@ -213,7 +240,6 @@ module.exports = async function (context, req) {
       if (c.name === "capture_ticket_request") {
         captured = args;
         await appendToSheet(toRow(captured));
-        // Friendly confirmation
         context.res.status = 200;
         context.res.body = {
           message:
@@ -225,18 +251,37 @@ module.exports = async function (context, req) {
 
       if (c.name === "web_search") {
         const results = await webSearch(args.q, args.location);
+        // Price hint (nice-to-have)
+        const price = looksLikePrice(args.q) ? guessPriceFromResults(results) : null;
+        const msg =
+          price
+            ? `${formatSearchResults(results)}\n\nRough current price I’m seeing: **${price}** (varies by seat/date). Want to submit a request?`
+            : formatSearchResults(results);
         context.res.status = 200;
-        context.res.body = {
-          message: formatSearchResults(results),
-          results,
-        };
+        context.res.body = { message: msg, results };
         return;
       }
     }
 
-    // No tools called → return assistant text
-    const assistantText =
-      toText(data?.output ?? data?.content ?? []) || "Got it!";
+    // ---- Fallback: no tool calls, but looks like search/price -> do it ourselves
+    if (looksLikeSearch(lastUser)) {
+      // Prefer Vivid Seats when user asked price-ish questions
+      const q = looksLikePrice(lastUser)
+        ? `${lastUser} site:vividseats.com`
+        : lastUser;
+      const results = await webSearch(q);
+      const price = looksLikePrice(lastUser) ? guessPriceFromResults(results) : null;
+      const msg =
+        price
+          ? `${formatSearchResults(results)}\n\nRough current price I’m seeing: **${price}** (varies by seat/date). Want to submit a request?`
+          : formatSearchResults(results);
+      context.res.status = 200;
+      context.res.body = { message: msg, results, note: "fallback_search" };
+      return;
+    }
+
+    // No tools and not a searchy message → plain assistant text
+    const assistantText = toText(data?.output ?? data?.content ?? []) || "Got it!";
     context.res.status = 200;
     context.res.body = { message: assistantText, captured: null };
   } catch (e) {
@@ -245,6 +290,7 @@ module.exports = async function (context, req) {
     context.res.body = { error: String(e) };
   }
 };
+
 
 // const { google } = require("googleapis");
 
