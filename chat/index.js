@@ -442,7 +442,8 @@ module.exports = async function (context, req) {
     }
 
     // ---------- Fallbacks
-    if (looksLikeSearch(lastUser)) {
+    // ---------- Fallbacks (only if we don't already have a complete request)
+    if (!haveRequired(extracted) && looksLikeSearch(lastUser)) {
       let bestNum = null;
       if (looksLikePrice(lastUser)) bestNum = await vividStartingPrice(lastUser);
       if (bestNum == null) {
@@ -454,6 +455,7 @@ module.exports = async function (context, req) {
       context.res.body = { message: msg, note: "fallback_search" };
       return;
     }
+
 
     // If no tool call & not a search, pass through assistant text (and keep conversation moving)
     let assistantText = toAssistantText(data);
