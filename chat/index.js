@@ -656,11 +656,11 @@ module.exports = async function (context, req) {
         };
 
     } catch (error) {
-        console.error('Error processing request:', error);
+        console.error("Error processing request:", error);
         context.res = {
             ...context.res,
             status: 500,
-            body: { error: 'Internal server error' }
+            body: { error: `Internal server error: ${error.message || error}` }
         };
     }
 };
@@ -669,7 +669,6 @@ module.exports = async function (context, req) {
 module.exports.searchArtistPerformances = searchArtistPerformances;
 module.exports.getEventRecommendations = getEventRecommendations;
 module.exports.getPriceFromVividSeats = getPriceFromVividSeats;
-
 
 
 
