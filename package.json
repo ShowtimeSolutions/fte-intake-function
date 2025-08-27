@@ -1,8 +1,19 @@
 {
-  "name": "fte-intake",
+  "name": "fte-intake-bot",
   "version": "1.0.0",
-  "type": "commonjs",
+  "description": "Azure Function for FTE Intake Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "func start",
+    "test": "echo \"No test specified\" && exit 1"
+  },
   "dependencies": {
-    "googleapis": "^133.0.0"
-  }
+    "@azure/functions": "^3.0.0",
+    "google-spreadsheet": "^4.1.1",
+    "google-auth-library": "^9.2.0",
+    "node-fetch": "^2.6.1"
+  },
+  "devDependencies": {},
+  "author": "Your Name",
+  "license": "MIT"
 }
