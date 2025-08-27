@@ -1,4 +1,4 @@
-// index.js — Azure Function (Node 18+) - FINAL FIXED VERSION
+// index.js — Azure Function (Node 18+) - ENHANCED FINAL VERSION
 // ------------------------------------
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
@@ -78,7 +78,7 @@ async function webSearch(query, location, { preferTickets = true, max = 5 } = {}
   }));
 }
 
-/* =====================  Chicago Events Recommendations - NEW  ===================== */
+/* =====================  Chicago Events Recommendations - ENHANCED  ===================== */
 let chicagoEventsCache = null;
 let cacheTimestamp = null;
 const CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
@@ -90,42 +90,78 @@ async function getChicagoEvents() {
   }
 
   try {
-    // Search for Chicago events on Vivid Seats
-    const searchResults = await webSearch("Chicago events this weekend concerts sports theater site:vividseats.com", null, { preferTickets: true, max: 10 });
+    // Enhanced search strategy - target major venues and popular events
+    const searchQueries = [
+      "United Center Chicago concerts site:vividseats.com",
+      "Soldier Field Chicago events site:vividseats.com", 
+      "Wrigley Field Chicago concerts site:vividseats.com",
+      "Chicago Theatre concerts site:vividseats.com",
+      "Riviera Theatre Chicago concerts site:vividseats.com"
+    ];
     
     const events = [];
-    for (const result of searchResults) {
-      // Extract event information from title and snippet
-      const eventMatch = result.title.match(/^(.+?)\s*(?:tickets|at|•|\-)/i);
-      const dateMatch = result.snippet.match(/(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\w+\s+\d+)(?:\s*•\s*(\d+:\d+\s*[AP]M))?/i);
-      const venueMatch = result.snippet.match(/(?:at\s+|•\s*)([^•]+?)(?:\s*•|\s*From|\s*$)/i);
-      const priceMatch = result.snippet.match(/From\s*\$(\d+)/i);
+    
+    // Search multiple venues for better event coverage
+    for (const query of searchQueries) {
+      try {
+        const searchResults = await webSearch(query, null, { preferTickets: true, max: 5 });
+        
+        for (const result of searchResults) {
+          // Enhanced event extraction
+          const eventMatch = result.title.match(/^(.+?)\s*(?:tickets|at|•|\-|chicago)/i);
+          const dateMatch = result.snippet.match(/(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\w+\s+\d+)(?:\s*•\s*(\d+:\d+\s*[AP]M))?/i) ||
+                           result.snippet.match(/(\w+\s+\d+)(?:\s*•\s*(\d+:\d+\s*[AP]M))?/i);
+          const venueMatch = result.snippet.match(/(?:at\s+|•\s*)([^•]+?)(?:\s*•|\s*From|\s*$)/i) ||
+                           result.title.match(/at\s+([^•\-]+)/i);
+          const priceMatch = result.snippet.match(/From\s*\$(\d+)/i) || result.snippet.match(/\$(\d+)/);
 
-      if (eventMatch) {
-        const event = {
-          name: eventMatch[1].trim(),
-          date: dateMatch ? `${dateMatch[1]} ${dateMatch[2]}` : 'TBD',
-          time: dateMatch && dateMatch[3] ? dateMatch[3] : '',
-          venue: venueMatch ? venueMatch[1].trim() : 'Chicago Area',
-          price: priceMatch ? parseInt(priceMatch[1]) : null,
-          link: result.link
-        };
-        events.push(event);
+          if (eventMatch && eventMatch[1]) {
+            const eventName = eventMatch[1].trim();
+            
+            // Skip if already added or if it's parking/irrelevant
+            if (events.some(e => e.name.toLowerCase().includes(eventName.toLowerCase())) ||
+                /parking|hotel|restaurant|merchandise/i.test(eventName)) {
+              continue;
+            }
+
+            const event = {
+              name: eventName,
+              date: dateMatch ? (dateMatch[1] ? `${dateMatch[1]} ${dateMatch[2] || ''}` : dateMatch[1]) : 'TBD',
+              time: (dateMatch && dateMatch[3]) ? dateMatch[3] : '',
+              venue: venueMatch ? venueMatch[1].trim() : 'Chicago Area',
+              price: priceMatch ? parseInt(priceMatch[1]) : null,
+              link: result.link
+            };
+            events.push(event);
+          }
+        }
+      } catch (error) {
+        console.error(`Error searching ${query}:`, error);
+        continue;
       }
     }
 
-    // Fallback: Add some popular Chicago events if search doesn't return enough
+    // Enhanced fallback events with real Chicago attractions
     if (events.length < 3) {
       const fallbackEvents = [
-        { name: "Chicago Bulls", date: "This Weekend", venue: "United Center", price: 85 },
-        { name: "Chicago Bears", date: "Sunday", venue: "Soldier Field", price: 120 },
+        { name: "Dua Lipa", date: "Fri Sep 5", venue: "United Center", price: 106, time: "7:30 PM" },
+        { name: "Dua Lipa", date: "Sat Sep 6", venue: "United Center", price: 106, time: "7:30 PM" },
+        { name: "Chicago Bulls", date: "This Season", venue: "United Center", price: 85 },
+        { name: "Chicago Bears", date: "This Season", venue: "Soldier Field", price: 120 },
         { name: "Chicago Cubs", date: "Various Dates", venue: "Wrigley Field", price: 45 },
         { name: "Chicago White Sox", date: "Various Dates", venue: "Guaranteed Rate Field", price: 35 },
         { name: "Chicago Symphony Orchestra", date: "This Weekend", venue: "Symphony Center", price: 65 },
-        { name: "Second City Comedy", date: "Nightly", venue: "Second City", price: 30 }
+        { name: "Second City Comedy", date: "Nightly", venue: "Second City", price: 30 },
+        { name: "Blue Man Group", date: "Various Dates", venue: "Charles Playhouse", price: 55 }
       ];
       
-      events.push(...fallbackEvents.slice(0, 6 - events.length));
+      // Add fallback events that aren't already in the list
+      for (const fallback of fallbackEvents) {
+        if (events.length >= 9) break;
+        if (!events.some(e => e.name.toLowerCase().includes(fallback.name.toLowerCase()))) {
+          events.push(fallback);
+        }
+      }
     }
 
     // Cache the results
@@ -135,16 +171,16 @@ async function getChicagoEvents() {
     return chicagoEventsCache;
   } catch (error) {
     console.error('Error fetching Chicago events:', error);
-    // Return fallback events
+    // Return enhanced fallback events
     return [
-      { name: "Chicago Bulls", date: "This Weekend", venue: "United Center", price: 85 },
-      { name: "Chicago Bears", date: "Sunday", venue: "Soldier Field", price: 120 },
-      { name: "Chicago Cubs", date: "Various Dates", venue: "Wrigley Field", price: 45 }
+      { name: "Dua Lipa", date: "Fri Sep 5", venue: "United Center", price: 106, time: "7:30 PM" },
+      { name: "Chicago Bulls", date: "This Season", venue: "United Center", price: 85 },
+      { name: "Chicago Bears", date: "This Season", venue: "Soldier Field", price: 120 }
     ];
   }
 }
 
-/* =====================  Price helpers - IMPROVED  ===================== */
+/* =====================  Price helpers - ENHANCED  ===================== */
 // More comprehensive price regex patterns
 const PRICE_PATTERNS = [
   /\$\s*(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi,  // $100 or $100-$200
@@ -185,11 +221,12 @@ function minPriceAcross(items) {
   return allPrices.length > 0 ? Math.min(...allPrices) : null;
 }
 
-// NEW: Vivid Seats-only price comparison function
+// ENHANCED: Vivid Seats-only price comparison function
 async function getAccurateTicketPrices(query) {
   try {
-    // Search only Vivid Seats
-    const vividSeatsResults = await webSearch(`${query} tickets site:vividseats.com`, null, { preferTickets: true, max: 3 });
+    // Search only Vivid Seats with enhanced query
+    const enhancedQuery = `${query} tickets site:vividseats.com`;
+    const vividSeatsResults = await webSearch(enhancedQuery, null, { preferTickets: true, max: 5 });
     
     const vividSeatsPrice = minPriceAcross(vividSeatsResults.filter(item => !irrelevant(item.title, item.snippet)));
     
@@ -204,11 +241,51 @@ async function getAccurateTicketPrices(query) {
   }
 }
 
+// NEW: Check if artist is performing (without price focus)
+async function checkArtistPerformance(query) {
+  try {
+    const searchResults = await webSearch(`${query} site:vividseats.com`, null, { preferTickets: true, max: 3 });
+    
+    for (const result of searchResults) {
+      // Look for date information in title and snippet
+      const dateMatch = result.snippet.match(/(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\w+\s+\d+)(?:\s*•\s*(\d+:\d+\s*[AP]M))?/i) ||
+                       result.title.match(/(\w+\s+\d+)/i);
+      const venueMatch = result.snippet.match(/(?:at\s+|•\s*)([^•]+?)(?:\s*•|\s*From|\s*$)/i) ||
+                        result.title.match(/at\s+([^•\-]+)/i);
+      
+      if (dateMatch) {
+        const date = dateMatch[1] ? `${dateMatch[1]} ${dateMatch[2] || ''}` : dateMatch[1];
+        const venue = venueMatch ? venueMatch[1].trim() : 'Chicago';
+        const time = (dateMatch && dateMatch[3]) ? ` at ${dateMatch[3]}` : '';
+        
+        return {
+          isPerforming: true,
+          date: date,
+          venue: venue,
+          time: time
+        };
+      }
+    }
+    
+    return { isPerforming: false };
+  } catch (error) {
+    console.error('Performance check error:', error);
+    return { isPerforming: false };
+  }
+}
+
 function priceSummaryMessage(priceData) {
   if (priceData && priceData.price) {
     return `I found tickets starting from $${priceData.price} on ${priceData.source}. How many tickets do you need?`;
   }
   return `I'll help you find the best prices. How many tickets are you looking for?`;
+}
+
+function performanceSummaryMessage(performanceData, artistName) {
+  if (performanceData.isPerforming) {
+    return `Yes! ${artistName} is performing on ${performanceData.date}${performanceData.time} at ${performanceData.venue}. Would you like ticket information?`;
+  }
+  return `I don't see any upcoming ${artistName} shows in Chicago right now. Would you like me to check for other artists or events?`;
 }
 
 /* =====================  Budget Range - IMPROVED  ===================== */
@@ -343,7 +420,7 @@ function userAskedForm(text) {
   return /\b(open|use|show)\b.*\b(form)\b|\bmanual request\b/i.test(text || "");
 }
 
-/* =====================  OpenAI - FIXED  ===================== */
+/* =====================  OpenAI - ENHANCED  ===================== */
 async function callOpenAI(messages) {
   const sysPrompt = `
 You are FTE's polite, fast, and helpful ticket intake assistant on a public website.
@@ -375,10 +452,10 @@ STYLE
 - Do not tell the user to fill a form. If they ask for the form, the website will open it.
 - After the user confirms the summary, CALL capture_ticket_request instead of asking again.
 
-PRICE / IDEAS
-- If the user asks "what's on" / "what's happening" / "recommendations" / "prices", call web_search first.
-- For price searches, be specific with the query including the artist/event name.
-- Suggestions: provide a short list (3–5 lines) if they ask for ideas.
+QUERY CLASSIFICATION - IMPORTANT:
+- PRICE queries: "what's the price", "how much", "cost", "price for" → Use web_search with search_type="price"
+- PERFORMANCE queries: "does X play", "is X performing", "when is X", "X in chicago" → Use web_search with search_type="performance"  
+- RECOMMENDATION queries: "recommendations", "what's happening", "suggestions", "what's on" → Use web_search with search_type="recommendations"
 
 IMPORTANT
 - Do not restart the conversation after the user confirms. Proceed to capture.
@@ -386,6 +463,7 @@ IMPORTANT
   you should immediately CALL capture_ticket_request after the user confirms, instead of asking again.
 - If the user says "no", "not sure", or "undecided", keep the chat light and offer to search events.
 - Always lean toward moving the user forward rather than looping back.
+- ONLY return prices when explicitly asked for prices, not when asked if someone is performing.
 
 TONE
 - Friendly, concise, approachable.
@@ -435,7 +513,12 @@ TONE
             type: "object",
             properties: {
               q: { type: "string", description: "Search query (include artist/venue and 'tickets' when relevant)" },
-              location: { type: "string", description: "City/Region (optional)" }
+              location: { type: "string", description: "City/Region (optional)" },
+              search_type: { 
+                type: "string", 
+                enum: ["price", "performance", "recommendations", "general"],
+                description: "Type of search: price (for pricing), performance (for dates/venues), recommendations (for suggestions), general (default)"
+              }
             },
             required: ["q"]
           }
@@ -469,19 +552,35 @@ function extractAssistantText(response) {
   return message?.content || "";
 }
 
-/* =====================  Intent helpers  ===================== */
+/* =====================  Intent helpers - ENHANCED  ===================== */
 function looksLikeSearch(msg) {
   const q = (msg || "").toLowerCase();
   return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game|popular|upcoming|suggest|recommend/.test(q);
 }
-function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
-function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
-function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
+
+// ENHANCED: Better price detection
+function looksLikePrice(msg) { 
+  return /(what.*price|how much|cost|price for|price of)/i.test(msg || ""); 
+}
+
+// NEW: Performance/date detection  
+function looksLikePerformance(msg) {
+  return /(does.*play|is.*performing|when is|.*in chicago|.*coming to|.*tour)/i.test(msg || "");
+}
+
+// ENHANCED: Better suggestion detection
+function wantsSuggestions(msg) { 
+  return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas|recommendations|recomendations|what.*happening|what's on)/i.test(msg || ""); 
+}
+
+function mentionsChicago(msg) { 
+  return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); 
+}
 
 /* =====================  Recommendation State Management  ===================== */
 let recommendationState = {};
 
-/* =====================  Azure Function entry - COMPLETED  ===================== */
+/* =====================  Azure Function entry - ENHANCED  ===================== */
 module.exports = async function (context, req) {
   context.res = {
     headers: {
@@ -536,7 +635,9 @@ module.exports = async function (context, req) {
 
       if (toolName === "web_search") {
         try {
-          if (wantsSuggestions(userText) || /recommendation/i.test(toolArgs.q)) {
+          const searchType = toolArgs.search_type || "general";
+          
+          if (searchType === "recommendations" || wantsSuggestions(userText)) {
             // Handle recommendations - get Chicago events
             const events = await getChicagoEvents();
             
@@ -562,16 +663,28 @@ module.exports = async function (context, req) {
             } else {
               finalMessage = "I'm having trouble finding current events. What specific artist or show are you looking for?";
             }
-          } else if (looksLikePrice(userText) || /price/i.test(toolArgs.q)) {
-            // Price search - use improved price comparison
+            
+          } else if (searchType === "price" || looksLikePrice(userText)) {
+            // Price search - use Vivid Seats only
             const priceData = await getAccurateTicketPrices(toolArgs.q);
             finalMessage = priceSummaryMessage(priceData);
+            
+          } else if (searchType === "performance" || looksLikePerformance(userText)) {
+            // Performance check - answer if they're performing, not price
+            const artistMatch = toolArgs.q.match(/(\w+(?:\s+\w+)*)/);
+            const artistName = artistMatch ? artistMatch[1] : "the artist";
+            
+            const performanceData = await checkArtistPerformance(toolArgs.q);
+            finalMessage = performanceSummaryMessage(performanceData, artistName);
+            
           } else {
             // General search
             const searchResults = await webSearch(toolArgs.q, toolArgs.location);
             const price = minPriceAcross(searchResults);
             if (price) {
               finalMessage = `I found tickets starting around $${price}. How many tickets do you need?`;
+            } else {
+              finalMessage = "I'm having trouble finding that information. Can you be more specific about what you're looking for?";
             }
           }
         } catch (error) {
@@ -609,7 +722,6 @@ module.exports = async function (context, req) {
     context.res.body = { error: String(e) };
   }
 };
-
 
 
 
