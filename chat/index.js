@@ -188,7 +188,6 @@ function extractTurnAware(messages) {
       out.date_or_date_range = dm ? dm[0] : ans.trim();
     }
     if (!out.name && /name/.test(q)) {
-      // keep just a name-looking answer (strip emails/phones)
       if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) out.name = ans.trim();
     }
     if (!out.email && /(email|e-mail)/.test(q)) {
@@ -200,7 +199,6 @@ function extractTurnAware(messages) {
       if (pm) out.phone = pm[0];
     }
     if (/notes?|special|requests?/i.test(q)) {
-      // simple notes capture
       if (!/no|none|n\/a/i.test(ans)) out.notes = ans.trim();
     }
   }
@@ -221,14 +219,12 @@ function extractFromTranscript(messages) {
   if (!artist && userTexts.length) artist = userTexts[0].trim();
   if (/^hi|hello|hey$/i.test(artist)) artist = "";
 
-  // qty: last numeric 1–12 in user msgs
   let qty = null;
   for (let i = userTexts.length-1; i >= 0; i--) {
     const m = userTexts[i].match(QTY_RE);
     if (m) { qty = parseInt(m[1], 10); if (qty>0 && qty<=12) break; }
   }
 
-  // budget tier: last budget-ish phrase
   let budget_tier = "";
   for (let i = userTexts.length-1; i >= 0; i--) {
     const bt = normalizeBudgetTier(userTexts[i]);
@@ -239,7 +235,6 @@ function extractFromTranscript(messages) {
   const dm = allText.match(DATE_WORDS);
   if (dm) date_or_date_range = dm[0];
 
-  // name: grab any standalone line that looks like a name
   let name = "";
   const nameAskIdx = messages.findLastIndex(m => m.role === "assistant" && /name/i.test(String(m.content||"")));
   if (nameAskIdx >= 0 && messages[nameAskIdx + 1]?.role === "user") {
@@ -301,7 +296,7 @@ You are FTE’s polite, fast, and helpful ticket intake assistant on a public we
 GOALS
 - Help the user pick or request tickets with minimum back-and-forth.
 - Be conversational, but ask only one short question at a time for missing details.
-- When the user confirms the details ("yes", "proceed", "go ahead", etc.), call the capture_ticket_request tool immediately with the fields you know.
+- When the user confirms the details ("yes", "proceed", "go ahead", etc.), CALL the capture_ticket_request tool immediately with the fields you know.
 - If the user wants ideas, dates, or prices, use the web_search tool first and reply with a short summary (no links, no long lists unless they ask).
 
 DATA TO CAPTURE (for capture_ticket_request)
@@ -326,7 +321,6 @@ PRICE / IDEAS
 - Suggestions: a short list (3–5 lines) if they ask for ideas; otherwise keep it brief.
 
 IMPORTANT
-IMPORTANT
 - Do not restart the conversation after the user confirms. Proceed to capture.
 - If you already know all the required details (artist/event, ticket_qty, budget_tier, name, email),
   you should immediately CALL capture_ticket_request after the user confirms, instead of asking again.
@@ -339,6 +333,142 @@ TONE
 - Use plain conversational English (no technical language).
 - Encourage the user lightly, but don’t oversell.
 - If something is unclear, ask naturally (e.g., “Did you mean for this weekend, or a specific date?”).
+`.trim();
+
+  const body = {
+    model: "gpt-4.1-mini",
+    temperature: 0.2,
+    input: [{ role: "system", content: sysPrompt }, ...messages],
+    tools: [
+      {
+        type: "function",
+        name: "capture_ticket_request",
+        description: "Finalize a ticket request and log to Google Sheets.",
+        parameters: {
+          type: "object",
+          properties: {
+            artist_or_event: { type: "string" },
+            ticket_qty: { type: "integer" },
+            budget_tier: {
+              type: "string",
+              enum: [
+                "<$50","$50–$99","$100–$149","$150–$199",
+                "$200–$249","$250–$299","$300–$349","$350–$399",
+                "$400–$499","$500+"
+              ]
+            },
+            date_or_date_range: { type: "string" },
+            name: { type: "string" },
+            email: { type: "string" },
+            phone: { type: "string" },
+            notes: { type: "string" }
+          },
+          required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
+        }
+      },
+      {
+        type: "function",
+        name: "web_search",
+        description: "Search the web for events, venues, dates, ticket info, or prices.",
+        parameters: {
+          type: "object",
+          properties: {
+            q: { type: "string", description: "Search query (include artist/venue and 'tickets' when relevant)" },
+            location: { type: "string", description: "City/Region (optional)" }
+          },
+          required: ["q"]
+        }
+      }
+    ],
+    tool_choice: "auto"
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp.ok) throw new Error(await resp.text());
+  return resp.json();
+}
+
+/* =====================  Responses helpers  ===================== */
+function digToolCalls(x) {
+  if (!x) return [];
+  if (Array.isArray(x)) return x.flatMap(digToolCalls);
+  const out = [];
+  if (x.type === "tool_call" && x.name) out.push(x);
+  if (x.output) out.push(...digToolCalls(x.output));
+  if (x.content) out.push(...digToolCalls(x.content));
+  return out;
+}
+function toAssistantText(obj) {
+  const tryList = [obj?.output_text, obj?.text, obj?.content, obj?.output];
+  const flat = (node) => {
+    if (!node) return "";
+    if (typeof node === "string") return node;
+    if (Array.isArray(node)) return node.map(flat).join("");
+    if (typeof node === "object") return [node.text, node.content, node.output].map(flat).join("");
+    return "";
+  };
+  for (const cand of tryList) {
+    const s = flat(cand).trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+/* =====================  Intent helpers  ===================== */
+function looksLikeSearch(msg) {
+  const q = (msg || "").toLowerCase();
+  return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game|popular|upcoming|suggest|recommend/.test(q);
+}
+function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
+function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
+function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
+
+/* =====================  Azure Function entry  ===================== */
+module.exports = async function (context, req) {
+  context.res = {
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type"
+    }
+  };
+
+  if (req.method === "OPTIONS") { context.res.status = 204; return; }
+  if (req.method !== "POST") { context.res.status = 405; context.res.body = { error: "Method not allowed" }; return; }
+
+  try {
+    // Manual modal capture from Framer
+    if (req.body?.direct_capture && req.body?.capture) {
+      await appendToSheet(toRow(req.body.capture));
+      context.res.status = 200;
+      context.res.body = { message: "Saved your request. We’ll follow up soon!", captured: req.body.capture };
+      return;
+    }
+
+    const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+
+    // If user explicitly asks for the form, instruct UI to open it
+    if (userAskedForm(lastUser)) {
+      context.res.status = 200;
+      context.res.body = { message: "Opening the manual request form…", openForm: true };
+      return;
+    }
+
+    // Guardrail: if transcript already contains everything & user confirms, capture directly
+    const turnAware = extractTurnAware(messages);
+    const backstop = extractFromTranscript(messages);
+    const extracted = mergeCapture(turnAware, backstop);
+
+    if (haveRequired(extracted) && userConfirmed(lastUser))
 
 
 
