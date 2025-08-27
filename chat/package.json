@@ -2,7 +2,7 @@
   "name": "fte-intake-bot",
   "version": "1.0.0",
   "description": "Azure Function for FTE Intake Bot",
-  "main": "chat/index.js",
+  "main": "index.js",
   "scripts": {
     "start": "func start",
     "test": "echo \"No test specified\" && exit 0"
