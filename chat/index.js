@@ -57,7 +57,6 @@ function toRow(c) {
 
 /* =====================  Serper Search  ===================== */
 async function webSearch(query, location, { preferTickets = true, max = 5 } = {}) {
-  // Bias queries toward ticket sites (cleaner snippets with prices)
   const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com)" : "";
   const hasTicketsWord = /\bticket(s)?\b/i.test(query);
   const qFinal =
@@ -88,7 +87,7 @@ function firstPrice(text) {
   let m; PRICE_RE.lastIndex = 0;
   while ((m = PRICE_RE.exec(text))) {
     const val = parseInt(m[1], 10);
-    if (!isNaN(val) && val >= 30) return val; // ignore super-low noise
+    if (!isNaN(val) && val >= 30) return val;
   }
   return null;
 }
@@ -100,7 +99,6 @@ function minPriceAcross(items) {
   }
   return best;
 }
-/** Try a vivid-first price for a query. */
 async function vividStartingPrice(q) {
   const items = await webSearch(`${q} tickets site:vividseats.com`, null, { preferTickets: true, max: 5 });
   const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !irrelevant(it.title, it.snippet));
@@ -111,17 +109,17 @@ async function vividStartingPrice(q) {
 }
 function priceSummaryMessage(priceNum) {
   if (priceNum != null) {
-    return `Summary: Lowest starting price around $${priceNum}.` + `\n\nWould you like me to open the request form?`;
+    return `Summary: Lowest starting price around $${priceNum}.` +
+           `\n\nWould you like me to open the request form?`;
   }
-  return `Summary: I couldn’t confirm a current starting price just yet.` + `\n\nWould you like me to open the request form?`;
+  return `Summary: I couldn’t confirm a current starting price just yet.` +
+         `\n\nWould you like me to open the request form?`;
 }
 
 /* =====================  Guardrail extraction  ===================== */
-// Map free-form budget phrases to your tiers.
 function normalizeBudgetTier(text = "") {
   const t = text.toLowerCase();
   const num = parseInt(t.replace(/[^\d]/g, ""), 10);
-
   if (/(<\s*\$?50|under\s*50|less\s*than\s*\$?50)/i.test(text)) return "<$50";
   if (/\b(50[\s–-]?99|50-99|50 to 99)\b/i.test(text)) return "$50–$99";
   if (/\b(100[\s–-]?149|100-149|100 to 149)\b/i.test(text)) return "$100–$149";
@@ -132,7 +130,6 @@ function normalizeBudgetTier(text = "") {
   if (/\b(350[\s–-]?399|350-399|350 to 399)\b/i.test(text)) return "$350–$399";
   if (/(400|450)/i.test(text)) return "$400–$499";
   if (/\$?500\+|over\s*\$?500|>\s*\$?500/i.test(text)) return "$500+";
-
   if (!isNaN(num)) {
     if (num < 50) return "<$50";
     if (num < 100) return "$50–$99";
@@ -153,60 +150,27 @@ const PHONE_RE = /\b(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/;
 const QTY_RE   = /\b(\d{1,2})\b/;
 const DATE_WORDS = /\b(today|tonight|tomorrow|this\s*(week|weekend)|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{1,2}(?:,\s*\d{4})?)\b/i;
 
-/** Turn-aware extraction: watches assistant questions then grabs the next user reply. */
+/** Turn-aware extraction */
 function extractTurnAware(messages) {
-  const out = {
-    artist_or_event: "",
-    ticket_qty: "",
-    budget_tier: "",
-    date_or_date_range: "",
-    name: "",
-    email: "",
-    phone: "",
-    notes: ""
-  };
-
+  const out = { artist_or_event:"", ticket_qty:"", budget_tier:"", date_or_date_range:"", name:"", email:"", phone:"", notes:"" };
   for (let i = 0; i < messages.length - 1; i++) {
-    const a = messages[i];
-    const u = messages[i + 1];
+    const a = messages[i], u = messages[i + 1];
     if (a.role !== "assistant" || u.role !== "user") continue;
     const q = String(a.content || "").toLowerCase();
     const ans = String(u.content || "");
-
-    if (!out.artist_or_event && /(artist|event).*(interested|looking|tickets?)/.test(q)) {
-      out.artist_or_event = ans.replace(/tickets?/ig, "").trim();
-    }
-    if (!out.ticket_qty && /(how many|quantity|qty)/.test(q)) {
-      const m = ans.match(QTY_RE);
-      if (m) out.ticket_qty = parseInt(m[1], 10);
-    }
-    if (!out.budget_tier && /(budget|price range|per ticket)/.test(q)) {
-      out.budget_tier = normalizeBudgetTier(ans);
-    }
-    if (!out.date_or_date_range && /(date|when)/.test(q)) {
-      const dm = ans.match(DATE_WORDS);
-      out.date_or_date_range = dm ? dm[0] : ans.trim();
-    }
-    if (!out.name && /name/.test(q)) {
-      if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) out.name = ans.trim();
-    }
-    if (!out.email && /(email|e-mail)/.test(q)) {
-      const em = ans.match(EMAIL_RE);
-      if (em) out.email = em[0];
-    }
-    if (!out.phone && /(phone|number)/.test(q)) {
-      const pm = ans.match(PHONE_RE);
-      if (pm) out.phone = pm[0];
-    }
-    if (/notes?|special|requests?/i.test(q)) {
-      if (!/no|none|n\/a/i.test(ans)) out.notes = ans.trim();
-    }
+    if (!out.artist_or_event && /(artist|event).*(interested|looking|tickets?)/.test(q)) out.artist_or_event = ans.replace(/tickets?/ig, "").trim();
+    if (!out.ticket_qty && /(how many|quantity|qty)/.test(q)) { const m = ans.match(QTY_RE); if (m) out.ticket_qty = parseInt(m[1], 10); }
+    if (!out.budget_tier && /(budget|price range|per ticket)/.test(q)) out.budget_tier = normalizeBudgetTier(ans);
+    if (!out.date_or_date_range && /(date|when)/.test(q)) { const dm = ans.match(DATE_WORDS); out.date_or_date_range = dm ? dm[0] : ans.trim(); }
+    if (!out.name && /name/.test(q)) { if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) out.name = ans.trim(); }
+    if (!out.email && /(email|e-mail)/.test(q)) { const em = ans.match(EMAIL_RE); if (em) out.email = em[0]; }
+    if (!out.phone && /(phone|number)/.test(q)) { const pm = ans.match(PHONE_RE); if (pm) out.phone = pm[0]; }
+    if (/notes?|special|requests?/i.test(q)) { if (!/no|none|n\/a/i.test(ans)) out.notes = ans.trim(); }
   }
-
   return out;
 }
 
-/** Heuristic extraction from the whole transcript (backstop). */
+/** Backstop extraction */
 function extractFromTranscript(messages) {
   const userTexts = messages.filter(m => m.role === "user").map(m => String(m.content||""));
   const allText = messages.map(m => String(m.content || "")).join("\n");
@@ -236,7 +200,7 @@ function extractFromTranscript(messages) {
   if (dm) date_or_date_range = dm[0];
 
   let name = "";
-  const nameAskIdx = messages.findLastIndex(m => m.role === "assistant" && /name/i.test(String(m.content||"")));
+  const nameAskIdx = messages.findLastIndex?.(m => m.role === "assistant" && /name/i.test(String(m.content||""))) ?? -1;
   if (nameAskIdx >= 0 && messages[nameAskIdx + 1]?.role === "user") {
     const ans = String(messages[nameAskIdx + 1].content || "");
     if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) name = ans.trim();
@@ -253,16 +217,7 @@ function extractFromTranscript(messages) {
   if (/aisle/i.test(allText)) notes = (notes ? notes + "; " : "") + "Aisle seat preferred";
   if (/ada|accessible/i.test(allText)) notes = (notes ? notes + "; " : "") + "ADA/accessible";
 
-  return {
-    artist_or_event: artist || "",
-    ticket_qty: qty ?? "",
-    budget_tier,
-    date_or_date_range,
-    name,
-    email,
-    phone,
-    notes
-  };
+  return { artist_or_event: artist || "", ticket_qty: qty ?? "", budget_tier, date_or_date_range, name, email, phone, notes };
 }
 
 function mergeCapture(a, b) {
@@ -463,12 +418,91 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // Guardrail: if transcript already contains everything & user confirms, capture directly
+    // Extract from conversation to guard against model loops
     const turnAware = extractTurnAware(messages);
     const backstop = extractFromTranscript(messages);
     const extracted = mergeCapture(turnAware, backstop);
 
-    if (haveRequired(extracted) && userConfirmed(lastUser))
+    // If we have everything and the user confirmed, capture immediately
+    if (haveRequired(extracted) && userConfirmed(lastUser)) {
+      await appendToSheet(toRow(extracted));
+      context.res.status = 200;
+      context.res.body = {
+        message: "Thanks! I saved your request and we’ll follow up shortly to confirm details.",
+        captured: extracted
+      };
+      return;
+    }
+
+    // Quick path: suggestions in Chicago
+    if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
+      const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true, max: 5 });
+      const best = minPriceAcross(items);
+      const msg = priceSummaryMessage(best);
+      context.res.status = 200;
+      context.res.body = { message: msg, results: [] };
+      return;
+    }
+
+    // Model pass
+    const data = await callOpenAI(messages);
+    const calls = digToolCalls(data);
+    context.log("Tool calls:", JSON.stringify(calls));
+
+    for (const c of calls) {
+      const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
+
+      if (c.name === "capture_ticket_request") {
+        await appendToSheet(toRow(args));
+        context.res.status = 200;
+        context.res.body = {
+          message: "Thanks! I saved your request and we’ll follow up shortly to confirm details.",
+          captured: args
+        };
+        return;
+      }
+
+      if (c.name === "web_search") {
+        let bestNum = null;
+        if (looksLikePrice(args.q)) bestNum = await vividStartingPrice(args.q);
+        if (bestNum == null) {
+          const results = await webSearch(args.q, args.location, { preferTickets: true });
+          bestNum = minPriceAcross(results);
+        }
+        const msg = priceSummaryMessage(bestNum);
+        context.res.status = 200;
+        context.res.body = { message: msg };
+        return;
+      }
+    }
+
+    // Fallback: if it's a searchy message, do a quick price lookup
+    if (looksLikeSearch(lastUser)) {
+      let bestNum = null;
+      if (looksLikePrice(lastUser)) bestNum = await vividStartingPrice(lastUser);
+      if (bestNum == null) {
+        const results = await webSearch(lastUser, null, { preferTickets: true });
+        bestNum = minPriceAcross(results);
+      }
+      const msg = priceSummaryMessage(bestNum);
+      context.res.status = 200;
+      context.res.body = { message: msg, note: "fallback_search" };
+      return;
+    }
+
+    // Otherwise, pass through model text (ensure we never return empty)
+    let assistantText = toAssistantText(data);
+    if (!assistantText) assistantText = "Great — which artist or event are you looking for, and how many tickets do you need?";
+    context.res.status = 200;
+    context.res.body = { message: assistantText };
+
+  } catch (e) {
+    context.log.error(e);
+    context.res.status = 500;
+    context.res.body = { error: String(e) };
+  }
+};
+
 
 
 
