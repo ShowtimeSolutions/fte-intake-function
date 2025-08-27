@@ -1,4 +1,4 @@
-// index.js — Azure Function (Node 18+)
+// index.js — Azure Function (Node 18+) - FIXED VERSION
 // ------------------------------------
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
@@ -57,7 +57,7 @@ function toRow(c) {
 
 /* =====================  Serper Search  ===================== */
 async function webSearch(query, location, { preferTickets = true, max = 5 } = {}) {
-  const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com)" : "";
+  const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com OR site:stubhub.com)" : "";
   const hasTicketsWord = /\bticket(s)?\b/i.test(query);
   const qFinal =
     query + (hasTicketsWord ? "" : " tickets") + (location ? ` ${location}` : "") + siteBias;
@@ -78,42 +78,71 @@ async function webSearch(query, location, { preferTickets = true, max = 5 } = {}
   }));
 }
 
-/* =====================  Price helpers  ===================== */
-const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi;
-const irrelevant = (t, s) => /parking|hotel|restaurant|faq|blog/i.test(`${t} ${s}`);
+/* =====================  Price helpers - IMPROVED  ===================== */
+// More comprehensive price regex patterns
+const PRICE_PATTERNS = [
+  /\$\s*(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi,  // $100 or $100-$200
+  /from\s*\$\s*(\d{2,4})/gi,                  // from $100
+  /starting\s*at\s*\$\s*(\d{2,4})/gi,         // starting at $100
+  /as\s*low\s*as\s*\$\s*(\d{2,4})/gi,         // as low as $100
+  /(\d{2,4})\s*dollars?/gi,                   // 100 dollars
+];
 
-function firstPrice(text) {
-  if (!text) return null;
-  let m; PRICE_RE.lastIndex = 0;
-  while ((m = PRICE_RE.exec(text))) {
-    const val = parseInt(m[1], 10);
-    if (!isNaN(val) && val >= 30) return val;
+const irrelevant = (t, s) => /parking|hotel|restaurant|faq|blog|merchandise|merch|food|drink/i.test(`${t} ${s}`);
+
+function extractPrices(text) {
+  if (!text) return [];
+  const prices = [];
+  
+  for (const pattern of PRICE_PATTERNS) {
+    pattern.lastIndex = 0; // Reset regex
+    let match;
+    while ((match = pattern.exec(text))) {
+      const val = parseInt(match[1], 10);
+      if (!isNaN(val) && val >= 20 && val <= 2000) { // Reasonable ticket price range
+        prices.push(val);
+      }
+    }
   }
-  return null;
+  
+  return [...new Set(prices)]; // Remove duplicates
 }
+
 function minPriceAcross(items) {
-  let best = null;
-  for (const it of items || []) {
-    const val = firstPrice(`${it.title} ${it.snippet}`);
-    if (val != null) best = best == null ? val : Math.min(best, val);
+  let allPrices = [];
+  for (const item of items || []) {
+    if (!irrelevant(item.title, item.snippet)) {
+      const prices = extractPrices(`${item.title} ${item.snippet}`);
+      allPrices.push(...prices);
+    }
   }
-  return best;
+  return allPrices.length > 0 ? Math.min(...allPrices) : null;
 }
-async function vividStartingPrice(q) {
-  const items = await webSearch(`${q} tickets site:vividseats.com`, null, { preferTickets: true, max: 5 });
-  const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !irrelevant(it.title, it.snippet));
-  const first = vividOnly[0];
-  if (!first) return null;
-  const p = firstPrice(`${first.title} ${first.snippet}`);
-  return p != null ? p : null;
+
+async function getTicketPrices(query) {
+  try {
+    // Search multiple ticket sites
+    const searches = await Promise.all([
+      webSearch(`${query} tickets site:vividseats.com`, null, { preferTickets: true, max: 3 }),
+      webSearch(`${query} tickets site:ticketmaster.com`, null, { preferTickets: true, max: 3 }),
+      webSearch(`${query} tickets site:stubhub.com`, null, { preferTickets: true, max: 3 }),
+    ]);
+    
+    const allResults = searches.flat();
+    const relevantResults = allResults.filter(item => !irrelevant(item.title, item.snippet));
+    
+    return minPriceAcross(relevantResults);
+  } catch (error) {
+    console.error('Price search error:', error);
+    return null;
+  }
 }
+
 function priceSummaryMessage(priceNum) {
   if (priceNum != null) {
-    return `Summary: Lowest starting price around $${priceNum}.` +
-           `\n\nWould you like me to open the request form?`;
+    return `I found tickets starting around $${priceNum}. What's your budget range?`;
   }
-  return `Summary: I couldn’t confirm a current starting price just yet.` +
-         `\n\nWould you like me to open the request form?`;
+  return `I'll help you find the best prices. What's your budget range?`;
 }
 
 /* =====================  Guardrail extraction  ===================== */
@@ -237,22 +266,22 @@ function haveRequired(c) {
   return !!(c.artist_or_event && c.ticket_qty && c.budget_tier && c.name && c.email);
 }
 function userConfirmed(text) {
-  return /\b(yes|yep|yeah|correct|confirm|finalize|go ahead|proceed|place it|submit|that’s right|that's right|looks good|do it|book it)\b/i.test(text || "");
+  return /\b(yes|yep|yeah|correct|confirm|finalize|go ahead|proceed|place it|submit|that's right|looks good|do it|book it)\b/i.test(text || "");
 }
 function userAskedForm(text) {
   return /\b(open|use|show)\b.*\b(form)\b|\bmanual request\b/i.test(text || "");
 }
 
-/* =====================  OpenAI  ===================== */
+/* =====================  OpenAI - FIXED  ===================== */
 async function callOpenAI(messages) {
   const sysPrompt = `
-You are FTE’s polite, fast, and helpful ticket intake assistant on a public website.
+You are FTE's polite, fast, and helpful ticket intake assistant on a public website.
 
 GOALS
 - Help the user pick or request tickets with minimum back-and-forth.
 - Be conversational, but ask only one short question at a time for missing details.
 - When the user confirms the details ("yes", "proceed", "go ahead", etc.), CALL the capture_ticket_request tool immediately with the fields you know.
-- If the user wants ideas, dates, or prices, use the web_search tool first and reply with a short summary (no links, no long lists unless they ask).
+- If the user wants ideas, dates, or prices, use the web_search tool first and reply with a short summary.
 
 DATA TO CAPTURE (for capture_ticket_request)
 - artist_or_event (required) — e.g., "Jonas Brothers"
@@ -271,74 +300,76 @@ STYLE
 - After the user confirms the summary, CALL capture_ticket_request instead of asking again.
 
 PRICE / IDEAS
-- If the user asks “what’s on” / “what’s happening” / “recommendations” / “prices”, call web_search first.
-- Price replies: “Summary: Lowest starting price around $X.” (nothing else).
-- Suggestions: a short list (3–5 lines) if they ask for ideas; otherwise keep it brief.
+- If the user asks "what's on" / "what's happening" / "recommendations" / "prices", call web_search first.
+- For price searches, be specific with the query including the artist/event name.
+- Suggestions: provide a short list (3–5 lines) if they ask for ideas.
 
 IMPORTANT
 - Do not restart the conversation after the user confirms. Proceed to capture.
 - If you already know all the required details (artist/event, ticket_qty, budget_tier, name, email),
   you should immediately CALL capture_ticket_request after the user confirms, instead of asking again.
-- If the user says “no”, “not sure”, or “undecided”, keep the chat light and offer to search events or
-  suggest popular shows (via web_search).
+- If the user says "no", "not sure", or "undecided", keep the chat light and offer to search events.
 - Always lean toward moving the user forward rather than looping back.
 
 TONE
 - Friendly, concise, approachable.
 - Use plain conversational English (no technical language).
-- Encourage the user lightly, but don’t oversell.
-- If something is unclear, ask naturally (e.g., “Did you mean for this weekend, or a specific date?”).
+- Encourage the user lightly, but don't oversell.
 `.trim();
 
   const body = {
-    model: "gpt-4.1-mini",
+    model: "gpt-4o-mini", // Fixed model name
     temperature: 0.2,
-    input: [{ role: "system", content: sysPrompt }, ...messages],
+    messages: [{ role: "system", content: sysPrompt }, ...messages], // Fixed: use 'messages' not 'input'
     tools: [
       {
         type: "function",
-        name: "capture_ticket_request",
-        description: "Finalize a ticket request and log to Google Sheets.",
-        parameters: {
-          type: "object",
-          properties: {
-            artist_or_event: { type: "string" },
-            ticket_qty: { type: "integer" },
-            budget_tier: {
-              type: "string",
-              enum: [
-                "<$50","$50–$99","$100–$149","$150–$199",
-                "$200–$249","$250–$299","$300–$349","$350–$399",
-                "$400–$499","$500+"
-              ]
+        function: { // Fixed: wrap in 'function' object
+          name: "capture_ticket_request",
+          description: "Finalize a ticket request and log to Google Sheets.",
+          parameters: {
+            type: "object",
+            properties: {
+              artist_or_event: { type: "string" },
+              ticket_qty: { type: "integer" },
+              budget_tier: {
+                type: "string",
+                enum: [
+                  "<$50","$50–$99","$100–$149","$150–$199",
+                  "$200–$249","$250–$299","$300–$349","$350–$399",
+                  "$400–$499","$500+"
+                ]
+              },
+              date_or_date_range: { type: "string" },
+              name: { type: "string" },
+              email: { type: "string" },
+              phone: { type: "string" },
+              notes: { type: "string" }
             },
-            date_or_date_range: { type: "string" },
-            name: { type: "string" },
-            email: { type: "string" },
-            phone: { type: "string" },
-            notes: { type: "string" }
-          },
-          required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
+            required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
+          }
         }
       },
       {
         type: "function",
-        name: "web_search",
-        description: "Search the web for events, venues, dates, ticket info, or prices.",
-        parameters: {
-          type: "object",
-          properties: {
-            q: { type: "string", description: "Search query (include artist/venue and 'tickets' when relevant)" },
-            location: { type: "string", description: "City/Region (optional)" }
-          },
-          required: ["q"]
+        function: { // Fixed: wrap in 'function' object
+          name: "web_search",
+          description: "Search the web for events, venues, dates, ticket info, or prices.",
+          parameters: {
+            type: "object",
+            properties: {
+              q: { type: "string", description: "Search query (include artist/venue and 'tickets' when relevant)" },
+              location: { type: "string", description: "City/Region (optional)" }
+            },
+            required: ["q"]
+          }
         }
       }
     ],
     tool_choice: "auto"
   };
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", { // Fixed: correct endpoint
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -351,30 +382,15 @@ TONE
   return resp.json();
 }
 
-/* =====================  Responses helpers  ===================== */
-function digToolCalls(x) {
-  if (!x) return [];
-  if (Array.isArray(x)) return x.flatMap(digToolCalls);
-  const out = [];
-  if (x.type === "tool_call" && x.name) out.push(x);
-  if (x.output) out.push(...digToolCalls(x.output));
-  if (x.content) out.push(...digToolCalls(x.content));
-  return out;
+/* =====================  Response helpers - SIMPLIFIED  ===================== */
+function extractToolCalls(response) {
+  const message = response?.choices?.[0]?.message;
+  return message?.tool_calls || [];
 }
-function toAssistantText(obj) {
-  const tryList = [obj?.output_text, obj?.text, obj?.content, obj?.output];
-  const flat = (node) => {
-    if (!node) return "";
-    if (typeof node === "string") return node;
-    if (Array.isArray(node)) return node.map(flat).join("");
-    if (typeof node === "object") return [node.text, node.content, node.output].map(flat).join("");
-    return "";
-  };
-  for (const cand of tryList) {
-    const s = flat(cand).trim();
-    if (s) return s;
-  }
-  return "";
+
+function extractAssistantText(response) {
+  const message = response?.choices?.[0]?.message;
+  return message?.content || "";
 }
 
 /* =====================  Intent helpers  ===================== */
@@ -386,118 +402,115 @@ function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg |
 function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
 function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
 
-/* =====================  Azure Function entry  ===================== */
+/* =====================  Azure Function entry - COMPLETED  ===================== */
 module.exports = async function (context, req) {
   context.res = {
     headers: {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Content-Type": "application/json"
     }
   };
 
-  if (req.method === "OPTIONS") { context.res.status = 204; return; }
-  if (req.method !== "POST") { context.res.status = 405; context.res.body = { error: "Method not allowed" }; return; }
+  if (req.method === "OPTIONS") {
+    context.res.status = 200;
+    context.res.body = {};
+    return;
+  }
 
   try {
-    // Manual modal capture from Framer
-    if (req.body?.direct_capture && req.body?.capture) {
-      await appendToSheet(toRow(req.body.capture));
-      context.res.status = 200;
-      context.res.body = { message: "Saved your request. We’ll follow up soon!", captured: req.body.capture };
+    const { messages = [] } = req.body || {};
+    
+    if (!Array.isArray(messages) || messages.length === 0) {
+      context.res.status = 400;
+      context.res.body = { error: "Invalid messages format" };
       return;
     }
 
-    const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-    const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+    const lastUserMessage = messages[messages.length - 1];
+    const userText = String(lastUserMessage?.content || "");
 
-    // If user explicitly asks for the form, instruct UI to open it
-    if (userAskedForm(lastUser)) {
+    // Handle special cases
+    if (userAskedForm(userText)) {
       context.res.status = 200;
-      context.res.body = { message: "Opening the manual request form…", openForm: true };
-      return;
-    }
-
-    // Extract from conversation to guard against model loops
-    const turnAware = extractTurnAware(messages);
-    const backstop = extractFromTranscript(messages);
-    const extracted = mergeCapture(turnAware, backstop);
-
-    // If we have everything and the user confirmed, capture immediately
-    if (haveRequired(extracted) && userConfirmed(lastUser)) {
-      await appendToSheet(toRow(extracted));
-      context.res.status = 200;
-      context.res.body = {
-        message: "Thanks! I saved your request and we’ll follow up shortly to confirm details.",
-        captured: extracted
+      context.res.body = { 
+        message: "I'll open the manual request form for you.",
+        action: "open_form"
       };
       return;
     }
 
-    // Quick path: suggestions in Chicago
-    if (wantsSuggestions(lastUser) && mentionsChicago(lastUser)) {
-      const items = await webSearch("popular shows Chicago", "Chicago IL", { preferTickets: true, max: 5 });
-      const best = minPriceAcross(items);
-      const msg = priceSummaryMessage(best);
-      context.res.status = 200;
-      context.res.body = { message: msg, results: [] };
-      return;
-    }
+    // Call OpenAI
+    const openaiResponse = await callOpenAI(messages);
+    const toolCalls = extractToolCalls(openaiResponse);
+    const assistantText = extractAssistantText(openaiResponse);
 
-    // Model pass
-    const data = await callOpenAI(messages);
-    const calls = digToolCalls(data);
-    context.log("Tool calls:", JSON.stringify(calls));
+    // Process tool calls
+    let finalMessage = assistantText;
+    let shouldCapture = false;
+    let captureData = null;
 
-    for (const c of calls) {
-      const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
+    for (const toolCall of toolCalls) {
+      const toolName = toolCall.function?.name;
+      const toolArgs = JSON.parse(toolCall.function?.arguments || "{}");
 
-      if (c.name === "capture_ticket_request") {
-        await appendToSheet(toRow(args));
-        context.res.status = 200;
-        context.res.body = {
-          message: "Thanks! I saved your request and we’ll follow up shortly to confirm details.",
-          captured: args
-        };
-        return;
-      }
-
-      if (c.name === "web_search") {
-        let bestNum = null;
-        if (looksLikePrice(args.q)) bestNum = await vividStartingPrice(args.q);
-        if (bestNum == null) {
-          const results = await webSearch(args.q, args.location, { preferTickets: true });
-          bestNum = minPriceAcross(results);
+      if (toolName === "web_search") {
+        try {
+          const searchResults = await webSearch(toolArgs.q, toolArgs.location);
+          
+          if (looksLikePrice(userText) || /price/i.test(toolArgs.q)) {
+            // Price search
+            const price = await getTicketPrices(toolArgs.q);
+            finalMessage = priceSummaryMessage(price);
+          } else if (wantsSuggestions(userText)) {
+            // Recommendations
+            const suggestions = searchResults
+              .filter(r => !irrelevant(r.title, r.snippet))
+              .slice(0, 5)
+              .map(r => `• ${r.title}`)
+              .join('\n');
+            finalMessage = suggestions ? 
+              `Here are some popular events:\n${suggestions}\n\nWhich one interests you?` :
+              "I'm having trouble finding current events. What specific artist or show are you looking for?";
+          } else {
+            // General search - extract price if available
+            const price = minPriceAcross(searchResults);
+            if (price) {
+              finalMessage = `I found tickets starting around $${price}. How many tickets do you need?`;
+            }
+          }
+        } catch (error) {
+          console.error('Search error:', error);
+          finalMessage = "I'm having trouble with the search right now. What specific event are you looking for?";
         }
-        const msg = priceSummaryMessage(bestNum);
-        context.res.status = 200;
-        context.res.body = { message: msg };
-        return;
+      } else if (toolName === "capture_ticket_request") {
+        shouldCapture = true;
+        captureData = toolArgs;
+        finalMessage = `Perfect! I've captured your request for ${toolArgs.ticket_qty} tickets to ${toolArgs.artist_or_event}. Our team will reach out to you at ${toolArgs.email} with the best options within your ${toolArgs.budget_tier} budget. Thanks, ${toolArgs.name}!`;
       }
     }
 
-    // Fallback: if it's a searchy message, do a quick price lookup
-    if (looksLikeSearch(lastUser)) {
-      let bestNum = null;
-      if (looksLikePrice(lastUser)) bestNum = await vividStartingPrice(lastUser);
-      if (bestNum == null) {
-        const results = await webSearch(lastUser, null, { preferTickets: true });
-        bestNum = minPriceAcross(results);
+    // Capture to Google Sheets if needed
+    if (shouldCapture && captureData) {
+      try {
+        const row = toRow(captureData);
+        await appendToSheet(row);
+        console.log('Successfully captured to Google Sheets:', captureData);
+      } catch (error) {
+        console.error('Google Sheets error:', error);
+        // Don't fail the whole request if sheets fails
       }
-      const msg = priceSummaryMessage(bestNum);
-      context.res.status = 200;
-      context.res.body = { message: msg, note: "fallback_search" };
-      return;
     }
 
-    // Otherwise, pass through model text (ensure we never return empty)
-    let assistantText = toAssistantText(data);
-    if (!assistantText) assistantText = "Great — which artist or event are you looking for, and how many tickets do you need?";
     context.res.status = 200;
-    context.res.body = { message: assistantText };
+    context.res.body = { 
+      message: finalMessage,
+      captured: shouldCapture
+    };
 
   } catch (e) {
-    context.log.error(e);
+    console.error('Function error:', e);
     context.res.status = 500;
     context.res.body = { error: String(e) };
   }
