@@ -1,38 +1,85 @@
-name: Build and Deploy — fte-intake-bot
+# Docs for the Azure Web Apps Deploy action: https://github.com/azure/functions-action
+# More GitHub Actions for Azure: https://github.com/Azure/actions
+
+name: Build and deploy Node.js project to Azure Function App - fte-intake-bot
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_NAME: fte-intake-bot        # <-- your Function App name
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: './chat'           # deploy from repo root
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.' # Deploy from repository root
+  NODE_VERSION: '20' # Changed from 22 to 20 for Azure Functions compatibility
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read #This is required for actions/checkout
 
     steps:
-      - name: Checkout
+      - name: 'Checkout GitHub Action'
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - name: Setup Node ${{ env.NODE_VERSION }} Environment
+        uses: actions/setup-node@v3
         with:
-          node-version: '18.x'
+          node-version: ${{ env.NODE_VERSION }}
 
-      - name: Install dependencies
-        run: npm ci --omit=dev
+      - name: 'Resolve Project Dependencies Using Npm'
+        shell: bash
+        run: |
+          pushd './${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}'
+          npm install
+          npm run build --if-present
+          npm run test --if-present
+          popd
 
-      # if you have per-function deps (you don't), add an npm ci in /chat as well
+      - name: Zip artifact for deployment
+        run: zip release.zip ./* -r
 
-      - name: Deploy to Azure Functions
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-app
+          path: release.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      id-token: write #This is required for requesting the JWT
+      contents: read #This is required for actions/checkout
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: node-app
+
+      - name: Unzip artifact for deployment
+        run: |
+          unzip release.zip
+          rm release.zip
+      
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_78F39F335E9742C48DF53B1A5ECC014C }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_40027BF369694D9B8E0AAB0391365C4B }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_41A5FB46DC9541EFB34CEE92E60EA02B }}
+
+      - name: 'Run Azure Functions Action'
         uses: Azure/functions-action@v1
+        id: fa
         with:
-          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+          app-name: 'fte-intake-bot'
+          slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE }}
+
+
 
 
 
