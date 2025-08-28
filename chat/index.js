@@ -1,337 +1,263 @@
 // index.js — Azure Function (Node 18+)
-// ------------------------------------
+const { google } = require("googleapis");
 const fetch = require("node-fetch");
-const { GoogleSpreadsheet } = require("google-spreadsheet");
-const { JWT } = require("google-auth-library");
 
-/* =====================  Google Sheets init (supports JSON or split vars)  ===================== */
-const SHEET_ID = process.env.GOOGLE_SHEETS_ID || "1KY-O6F-6rwSUsCvfQGQaADu985jTDCUJN4Oc0zKpiBA";
-const TAB_NAME = process.env.GOOGLE_SHEETS_TAB || "Local Price Tracker";
-
-async function getSheetsDoc() {
-  // Prefer a single JSON blob if provided
-  const jsonCred = process.env.GOOGLE_SHEETS_CREDENTIALS;
-  let clientEmail, privateKey;
-
-  if (jsonCred) {
-    try {
-      const parsed = JSON.parse(jsonCred);
-      clientEmail = parsed.client_email;
-      privateKey = parsed.private_key;
-    } catch (err) {
-      throw new Error("GOOGLE_SHEETS_CREDENTIALS is not valid JSON");
-    }
-  } else {
-    clientEmail = process.env.GOOGLE_SHEETS_CLIENT_EMAIL;
-    privateKey = process.env.GOOGLE_SHEETS_PRIVATE_KEY;
-    if (!clientEmail || !privateKey) {
-      throw new Error(
-        "Missing Google Sheets creds. Set either GOOGLE_SHEETS_CREDENTIALS (JSON) or GOOGLE_SHEETS_CLIENT_EMAIL and GOOGLE_SHEETS_PRIVATE_KEY."
-      );
-    }
+/* =====================  ENV GUARDRAILS  ===================== */
+function mustGetEnv(name) {
+  const v = process.env[name];
+  if (!v || String(v).trim() === "") {
+    throw new Error(`Missing required environment variable ${name}`);
   }
+  return v;
+}
+const OPENAI_API_KEY = mustGetEnv("OPENAI_API_KEY");
+const OPENAI_API_BASE = (process.env.OPENAI_API_BASE || "https://api.openai.com/v1").replace(/\/+$/, "");
+const SERPER_API_KEY = mustGetEnv("SERPER_API_KEY");
+const SHEET_ID = mustGetEnv("GOOGLE_SHEETS_ID");
+const SHEET_RANGE = process.env.GOOGLE_SHEETS_RANGE || "Sheet1!A:I";
+const SHEETS_CREDS_RAW = mustGetEnv("GOOGLE_SHEETS_CREDENTIALS");
 
-  const auth = new JWT({
-    email: clientEmail,
-    key: (privateKey || "").replace(/\\n/g, "\n"),
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+/* =====================  Google Sheets  ===================== */
+function parseServiceAccount(jsonStr) {
+  let creds = typeof jsonStr === "string" ? JSON.parse(jsonStr) : jsonStr;
+  // Fix common newline escaping on the private key:
+  if (creds.private_key && creds.private_key.includes("\\n")) {
+    creds.private_key = creds.private_key.replace(/\\n/g, "\n");
+  }
+  return creds;
+}
+
+async function getSheetsClient() {
+  const creds = parseServiceAccount(SHEETS_CREDS_RAW);
+  const auth = new google.auth.JWT(
+    creds.client_email,
+    null,
+    creds.private_key,
+    ["https://www.googleapis.com/auth/spreadsheets"]
+  );
+  await auth.authorize();
+  return google.sheets({ version: "v4", auth });
+}
+
+async function appendToSheet(row) {
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: SHEET_RANGE,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [row] },
   });
-
-  const doc = new GoogleSpreadsheet(SHEET_ID, auth);
-  await doc.loadInfo();
-  return doc;
 }
 
-/* =====================  Simple cache  ===================== */
-let sheetsCache = { data: null, ts: 0, ttl: 30 * 60 * 1000 }; // 30m
-
-async function loadEventsData() {
-  const now = Date.now();
-  if (sheetsCache.data && now - sheetsCache.ts < sheetsCache.ttl) return sheetsCache.data;
-
-  const doc = await getSheetsDoc();
-  const sheet = doc.sheetsByTitle[TAB_NAME];
-  if (!sheet) throw new Error(`Sheet tab "${TAB_NAME}" not found`);
-
-  const rows = await sheet.getRows();
-  const events = rows
-    .map((row) => ({
-      eventId: row.get("Event ID"),
-      artist: row.get("Artist"),
-      venue: row.get("Venue"),
-      date: row.get("Date"),
-      vividLink: row.get("Vivid Link"),
-      skyboxLink: row.get("SkyBox Link"),
-      priceTrend: row.get("Price Trend"),
-      initialTrackingDate: row.get("Initial Tracking Date"),
-      currentPrice: getCurrentPrice(row),
-    }))
-    .filter((e) => e.artist && e.date);
-
-  sheetsCache = { data: events, ts: now, ttl: sheetsCache.ttl };
-  return events;
+/**
+ * Unified row (A..I):
+ *  A Timestamp
+ *  B Artist_or_event
+ *  C Ticket_qty
+ *  D Budget_tier
+ *  E Date_or_date_range
+ *  F Name
+ *  G Email
+ *  H Phone
+ *  I Notes
+ */
+function toRow(c) {
+  const ts = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" }); // A
+  const artist = c?.artist_or_event || "";                                        // B
+  const qty = Number.isFinite(c?.ticket_qty)
+    ? c.ticket_qty
+    : (parseInt(c?.ticket_qty || "", 10) || "");                                   // C
+  const budgetTier = c?.budget_tier || "";                                         // D
+  const dateRange = c?.date_or_date_range || "";                                   // E
+  const name = c?.name || "";                                                      // F
+  const email = c?.email || "";                                                    // G
+  const phone = c?.phone || "";                                                    // H
+  const notes = c?.notes || "";                                                    // I
+  return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
 }
 
-function getCurrentPrice(row) {
-  // scan first non-empty "Price #N"
-  for (let i = 1; i <= 42; i++) {
-    const v = row.get(`Price #${i}`);
-    if (v && String(v).trim()) return v;
+/* =====================  Serper Search  ===================== */
+async function webSearch(query, location, { preferTickets = true, max = 5 } = {}) {
+  // Bias queries toward tickets sites (cleaner snippets with prices)
+  const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com)" : "";
+  const hasTicketsWord = /\bticket(s)?\b/i.test(query);
+  const qFinal =
+    query + (hasTicketsWord ? "" : " tickets") + (location ? ` ${location}` : "") + siteBias;
+
+  const resp = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ q: qFinal, num: max }),
+  });
+  if (!resp.ok) throw new Error(`Serper error: ${await resp.text()}`);
+  const data = await resp.json();
+
+  return (data.organic || []).map((r, i) => ({
+    n: i + 1,
+    title: r.title || "",
+    link: r.link || "",
+    snippet: r.snippet || "",
+  }));
+}
+
+/* =====================  Price helpers  ===================== */
+const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi;
+const irrelevant = (t, s) => /parking|hotel|restaurant|faq|blog/i.test(`${t} ${s}`);
+
+function firstPrice(text) {
+  if (!text) return null;
+  let m; PRICE_RE.lastIndex = 0;
+  while ((m = PRICE_RE.exec(text))) {
+    const val = parseInt(m[1], 10);
+    if (!isNaN(val) && val >= 30) return val; // ignore super-low noise
   }
   return null;
 }
-
-/* =====================  Search / Recos / Prices  ===================== */
-async function searchArtistPerformances(artistQuery) {
-  try {
-    const events = await loadEventsData();
-    const q = (artistQuery || "").toLowerCase().trim();
-    const matches = events.filter((e) => {
-      const a = (e.artist || "").toLowerCase();
-      return (
-        a.includes(q) ||
-        q.includes(a) ||
-        a.split(/[-\s]+/).some((w) => q.includes(w)) ||
-        q.split(/[-\s]+/).some((w) => a.includes(w))
-      );
-    });
-    return matches.sort((a, b) => new Date(a.date) - new Date(b.date));
-  } catch (e) {
-    console.error("searchArtistPerformances error:", e);
-    return [];
+function minPriceAcross(items) {
+  let best = null;
+  for (const it of items || []) {
+    const val = firstPrice(`${it.title} ${it.snippet}`);
+    if (val != null) best = best == null ? val : Math.min(best, val);
   }
+  return best;
+}
+async function vividStartingPrice(q) {
+  const items = await webSearch(`${q} tickets site:vividseats.com`, null, { preferTickets: true, max: 5 });
+  const vividOnly = items.filter(it => /vividseats\.com/i.test(it.link) && !irrelevant(it.title, it.snippet));
+  const first = vividOnly[0];
+  if (!first) return null;
+  const p = firstPrice(`${first.title} ${first.snippet}`);
+  return p != null ? p : null;
+}
+function priceSummaryMessage(priceNum) {
+  if (priceNum != null) {
+    return `Summary: Lowest starting price around $${priceNum}.\n\nWould you like me to open the request form?`;
+  }
+  return `Summary: I couldn’t confirm a current starting price just yet.\n\nWould you like me to open the request form?`;
 }
 
-async function getEventRecommendations(dateFilter = null, offset = 0, limit = 3) {
-  try {
-    const events = await loadEventsData();
+/* =====================  Guardrail extraction (turn-aware + backstop)  ===================== */
+function normalizeBudgetTier(text = "") {
+  const t = text.toLowerCase();
+  const num = parseInt(t.replace(/[^\d]/g, ""), 10);
 
-    const window = (() => {
-      const start = new Date();
-      const end = new Date();
-      const t = (s, d) => end.setDate(start.getDate() + d);
-      if (!dateFilter) return { start, end: new Date(end.setDate(start.getDate() + 30)) };
-      const f = dateFilter.toLowerCase();
-      if (f.includes("weekend")) {
-        const today = new Date();
-        const dow = today.getDay();
-        const daysUntilFri = dow <= 5 ? 5 - dow : 7 - dow + 5;
-        const s2 = new Date(today);
-        s2.setDate(today.getDate() + daysUntilFri);
-        const e2 = new Date(s2);
-        e2.setDate(s2.getDate() + 2);
-        return { start: s2, end: e2 };
-      }
-      if (f.includes("week")) {
-        end.setDate(start.getDate() + 7);
-        return { start, end };
-      }
-      if (f.includes("month")) {
-        end.setDate(start.getDate() + 30);
-        return { start, end };
-      }
-      if (f.includes("tonight") || f.includes("today")) {
-        end.setDate(start.getDate() + 1);
-        return { start, end };
-      }
-      end.setDate(start.getDate() + 14);
-      return { start, end };
-    })();
+  if (/(<\s*\$?50|under\s*50|less\s*than\s*\$?50)/i.test(text)) return "<$50";
+  if (/\b(50[\s–-]?99|50-99|50 to 99)\b/i.test(text)) return "$50–$99";
+  if (/\b(100[\s–-]?149|100-149|100 to 149)\b/i.test(text)) return "$100–$149";
+  if (/\b(150[\s–-]?199|150-199|150 to 199)\b/i.test(text)) return "$150–$199";
+  if (/\b(200[\s–-]?249|200-249|200 to 249)\b/i.test(text)) return "$200–$249";
+  if (/\b(250[\s–-]?299|250-299|250 to 299)\b/i.test(text)) return "$250–$299";
+  if (/\b(300[\s–-]?349|300-349|300 to 349)\b/i.test(text)) return "$300–$349";
+  if (/\b(350[\s–-]?399|350-399|350 to 399)\b/i.test(text)) return "$350–$399";
+  if (/(400|450)/i.test(text)) return "$400–$499";
+  if (/\$?500\+|over\s*\$?500|>\s*\$?500/i.test(text)) return "$500+";
 
-    const filtered = events.filter((e) => {
-      const d = new Date(e.date);
-      return d >= window.start && d <= window.end;
-    });
-
-    const sorted = filtered.sort((a, b) => new Date(a.date) - new Date(b.date));
-    const page = sorted.slice(offset, offset + limit);
-    return { events: page, total: sorted.length, hasMore: offset + limit < sorted.length };
-  } catch (e) {
-    console.error("getEventRecommendations error:", e);
-    return { events: [], total: 0, hasMore: false };
+  if (!isNaN(num)) {
+    if (num < 50) return "<$50";
+    if (num < 100) return "$50–$99";
+    if (num < 150) return "$100–$149";
+    if (num < 200) return "$150–$199";
+    if (num < 250) return "$200–$249";
+    if (num < 300) return "$250–$299";
+    if (num < 350) return "$300–$349";
+    if (num < 400) return "$350–$399";
+    if (num < 500) return "$400–$499";
+    return "$500+";
   }
+  return "";
 }
 
-async function getPriceFromVividSeats(vividLink) {
-  try {
-    if (!vividLink || !String(vividLink).trim()) return null;
-    const res = await fetch(vividLink, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
-    });
-    if (!res.ok) return null;
-    const html = await res.text();
+const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const PHONE_RE = /\b(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/;
+const QTY_RE   = /\b(\d{1,2})\b/;
+const DATE_WORDS = /\b(today|tonight|tomorrow|this\s*(week|weekend)|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{1,2}(?:,\s*\d{4})?)\b/i;
 
-    const patterns = [
-      /get in for \$(\d+)/i,
-      /starting at \$(\d+)/i,
-      /from \$(\d+)/i,
-      /\$(\d+)\+/,
-      /"price":\s*"?\$?(\d+)/i,
-      /data-price="(\d+)"/i,
-      /price-value[^>]*>\$(\d+)/i,
-    ];
-    for (const re of patterns) {
-      const m = html.match(re);
-      if (m && m[1]) return `$${m[1]}`;
-    }
-    return null;
-  } catch (e) {
-    console.error("getPriceFromVividSeats error:", e);
-    return null;
-  }
-}
-
-async function getPriceFromDatabase(artistQuery) {
-  const events = await loadEventsData();
-  const q = (artistQuery || "").toLowerCase().trim();
-  const matches = events.filter((e) => (e.artist || "").toLowerCase().includes(q));
-  if (!matches.length) return null;
-
-  const event = matches[0];
-  if (event.vividLink) {
-    const p = await getPriceFromVividSeats(event.vividLink);
-    return { price: p, source: "vivid_seats", event };
-  }
-  return { price: null, source: "vivid_seats", event };
-}
-
-/* =====================  OpenAI chat (safe base URL default)  ===================== */
-async function getChatCompletion(messages) {
-  const systemPrompt = `You are a helpful ticket assistant for Fair Ticket Exchange. You help customers find tickets for events in the Chicago area.
-
-IMPORTANT QUERY CLASSIFICATION:
-1) PERFORMANCE QUERIES → use the in-database search first (searchArtistPerformances).
-2) PRICE QUERIES → try getPriceFromDatabase (uses Vivid Seats link in our sheet) before any web search.
-3) RECOMMENDATION QUERIES → use getEventRecommendations (3 items/page).
-
-FLOW:
-- Be conversational and brief; one question at a time.
-- If database has it, answer directly. If not, say you can research (not 100% accurate).
-- When the user provides artist, quantity, budget, date, name, and email, you can summarize and confirm next steps.`;
-
-  const base = (process.env.OPENAI_API_BASE || "https://api.openai.com").replace(/\/+$/, "");
-  try {
-    const resp = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", // smaller, fast default; change if you prefer
-        messages: [{ role: "system", content: systemPrompt }, ...messages],
-        max_tokens: 500,
-        temperature: 0.7,
-      }),
-    });
-    if (!resp.ok) throw new Error(`OpenAI API error: ${resp.status}`);
-    const data = await resp.json();
-    return data.choices?.[0]?.message?.content || "Thanks! How can I help with tickets?";
-  } catch (e) {
-    console.error("OpenAI API error:", e);
-    return "I'm having trouble processing your request right now. Please try again.";
-  }
-}
-
-/* =====================  Router for user messages  ===================== */
-function includesAny(s, arr) {
-  const t = (s || "").toLowerCase();
-  return arr.some((w) => t.includes(w));
-}
-
-async function processUserMessage(userMessage, conversationHistory = []) {
-  const msg = (userMessage || "").toLowerCase().trim();
-
-  // Performance queries
-  if (
-    (msg.startsWith("does ") && (msg.includes(" play") || msg.includes(" perform"))) ||
-    (msg.startsWith("is ") && (msg.includes(" playing") || msg.includes(" performing"))) ||
-    msg.startsWith("when is ")
-  ) {
-    const m = msg.match(/(?:does|is|when is)\s+([^?]+?)(?:\s+(?:play|perform|playing|performing))?/i);
-    if (m) {
-      const artist = (m[1] || "").trim();
-      const shows = await searchArtistPerformances(artist);
-      if (shows.length) {
-        const s = shows[0];
-        const date = new Date(s.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
-        return `Yes — ${s.artist} is on ${date} at ${s.venue}. Want ticket info?`;
-      }
-    }
-  }
-
-  // Price queries
-  if (includesAny(msg, ["price", "cost", "how much"])) {
-    const m = msg.match(/(?:price|cost|how much).*?(?:for|of)\s+([^?]+)/i);
-    const artist = m ? m[1].trim() : msg.replace(/(price|cost|how much)/gi, "").trim();
-    if (artist) {
-      const res = await getPriceFromDatabase(artist);
-      if (res?.price) return `I’m seeing tickets from ${res.price}. How many tickets do you need?`;
-      if (res?.event) return `I found the event but don’t have a live price yet. I can still help you request tickets—how many do you need?`;
-    }
-  }
-
-  // Recommendations
-  if (includesAny(msg, ["recommend", "what's happening", "happening", "events", "shows", "weekend"])) {
-    let filter = null;
-    if (msg.includes("weekend")) filter = "weekend";
-    else if (msg.includes("week")) filter = "week";
-    else if (msg.includes("month")) filter = "month";
-    else if (msg.includes("tonight") || msg.includes("today")) filter = "tonight";
-
-    const rec = await getEventRecommendations(filter, 0, 3);
-    if (rec.events.length) {
-      let out = "Here are a few upcoming options:\n\n";
-      rec.events.forEach((e, i) => {
-        const d = new Date(e.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
-        out += `${i + 1}. ${e.artist} — ${d} at ${e.venue}${e.currentPrice ? ` (from ${e.currentPrice})` : ""}\n`;
-      });
-      if (rec.hasMore) out += `\nWant to see more? I have ${rec.total - 3} additional picks.`;
-      return out;
-    }
-  }
-
-  // Fall back to LLM
-  const messages = [...conversationHistory, { role: "user", content: userMessage }];
-  return await getChatCompletion(messages);
-}
-
-/* =====================  Azure Function entry  ===================== */
-module.exports = async function (context, req) {
-  context.res = {
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    },
+function extractTurnAware(messages) {
+  const out = {
+    artist_or_event: "", ticket_qty: "", budget_tier: "",
+    date_or_date_range: "", name: "", email: "", phone: "", notes: ""
   };
-  if (req.method === "OPTIONS") {
-    context.res.status = 200;
-    return;
-  }
+  for (let i = 0; i < messages.length - 1; i++) {
+    const a = messages[i], u = messages[i + 1];
+    if (a.role !== "assistant" || u.role !== "user") continue;
+    const q = String(a.content || "").toLowerCase();
+    const ans = String(u.content || "");
 
-  try {
-    const { message, conversationHistory } = req.body || {};
-    if (!message) {
-      context.res.status = 400;
-      context.res.body = { error: "Message is required" };
-      return;
+    if (!out.artist_or_event && /(artist|event).*(interested|looking|tickets?)/.test(q)) {
+      out.artist_or_event = ans.replace(/tickets?/ig, "").trim();
     }
-
-    const reply = await processUserMessage(message, conversationHistory || []);
-    context.res.status = 200;
-    context.res.body = { response: reply };
-  } catch (e) {
-    console.error("Function error:", e);
-    context.res.status = 500;
-    context.res.body = { error: `Internal server error: ${e.message || e}` };
+    if (!out.ticket_qty && /(how many|quantity|qty)/.test(q)) {
+      const m = ans.match(QTY_RE);
+      if (m) out.ticket_qty = parseInt(m[1], 10);
+    }
+    if (!out.budget_tier && /(budget|price range|per ticket)/.test(q)) {
+      out.budget_tier = normalizeBudgetTier(ans);
+    }
+    if (!out.date_or_date_range && /(date|when)/.test(q)) {
+      const dm = ans.match(DATE_WORDS);
+      out.date_or_date_range = dm ? dm[0] : ans.trim();
+    }
+    if (!out.name && /name/.test(q)) {
+      if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) out.name = ans.trim();
+    }
+    if (!out.email && /(email|e-mail)/.test(q)) {
+      const em = ans.match(EMAIL_RE);
+      if (em) out.email = em[0];
+    }
+    if (!out.phone && /(phone|number)/.test(q)) {
+      const pm = ans.match(PHONE_RE);
+      if (pm) out.phone = pm[0];
+    }
+    if (/notes?|special|requests?/i.test(q)) {
+      if (!/no|none|n\/a/i.test(ans)) out.notes = ans.trim();
+    }
   }
-};
+  return out;
+}
 
-// Optional: export helpers for tests
-module.exports.searchArtistPerformances = searchArtistPerformances;
-module.exports.getEventRecommendations = getEventRecommendations;
-module.exports.getPriceFromVividSeats = getPriceFromVividSeats;
+function extractFromTranscript(messages) {
+  const userTexts = messages.filter(m => m.role === "user").map(m => String(m.content||""));
+  const allText = messages.map(m => String(m.content || "")).join("\n");
+
+  let artist = "";
+  for (const t of userTexts) {
+    const m = t.match(/(?:see|want|looking.*for|tickets? for|go to|interested in)\s+(.+)/i);
+    if (m) { artist = m[1].replace(/tickets?$/i, "").trim(); break; }
+  }
+  if (!artist && userTexts.length) artist = userTexts[0].trim();
+  if (/^hi|hello|hey$/i.test(artist)) artist = "";
+
+  let qty = null;
+  for (let i = userTexts.length-1; i >= 0; i--) {
+    const m = userTexts[i].match(QTY_RE);
+    if (m) { qty = parseInt(m[1], 10); if (qty>0 && qty<=12) break; }
+  }
+  let budget_tier = "";
+  for (let i = userTexts.length-1; i >= 0; i--) {
+    const bt = normalizeBudgetTier(userTexts[i]);
+    if (bt) { budget_tier = bt; break; }
+  }
+  let date_or_date_range = "";
+  const dm = allText.match(DATE_WORDS);
+  if (dm) date_or_date_range = dm[0];
+
+  let name = "";
+  const nameAskIdx = messages.findLastIndex(m => m.role === "assistant" && /name/i.test(String(m.content||"")));
+  if (nameAskIdx >= 0 && messages[nameAskIdx + 1]?.role === "user") {
+    const ans = String(messages[nameAskIdx + 1].content || "");
+    if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) name = ans.trim();
+  }
+  if (!name) {
+    const nm = allText.match(/\bmy name is ([a-z ,.'-]{2,60})/i) || allText.match(/\bi am ([a-z ,.'-]{2,60})/i);
+    if (nm) name = nm[1].trim();
+  }
+
+  const email = (allText.match(EMAIL_RE) || [""])[0];
+  const phone = (allText.match(PHONE_RE) || [""])[0];
+
+  let notes = "";
+  if (/aisle/i.test(allText)) notes = (notes ? notes + "; " : "") + "Aisle seat preferred";
+  if (/ada|accessible/i.test(allText)) notes = (notes ?
 
 
 
