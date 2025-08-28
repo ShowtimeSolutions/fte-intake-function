@@ -1,5 +1,5 @@
 // index.js — Azure Function (Node 18+) - FIXED VERSION
-// ------------------------------------
+
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
 
