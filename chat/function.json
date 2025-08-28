@@ -7,7 +7,12 @@
       "name": "req",
       "methods": ["post", "options"],
       "route": "chat"
+    },
+    {
+      "type": "http",
+      "direction": "out",
+      "name": "res"
     }
   ],
-  "scriptFile": "index.js" 
+  "scriptFile": "index.js"
 }
