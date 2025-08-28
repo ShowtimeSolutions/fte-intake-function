@@ -10,11 +10,10 @@
   },
   "dependencies": {
     "@azure/functions": "^3.0.0",
-    "google-spreadsheet": "^4.1.1",
-    "google-auth-library": "^9.2.0",
+    "googleapis": "^126.0.1",
     "node-fetch": "^2.6.1"
   },
   "devDependencies": {},
-  "author": "Your Name",
+  "author": "FTE Team",
   "license": "MIT"
 }
