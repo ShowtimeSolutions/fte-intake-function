@@ -1,12 +1,10 @@
-
 {
   "name": "fte-intake-bot",
   "version": "1.0.0",
   "private": true,
-  "main": "chat/index.js",
   "engines": { "node": ">=18" },
   "dependencies": {
-    "googleapis": "^131.0.0",
+    "googleapis": "^118.0.0",
     "node-fetch": "^2.6.12"
   }
 }
