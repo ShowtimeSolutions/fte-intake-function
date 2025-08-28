@@ -2,18 +2,11 @@
 {
   "name": "fte-intake-bot",
   "version": "1.0.0",
-  "description": "Azure Function for FTE Intake Bot",
-  "main": "index.js",
-  "scripts": {
-    "start": "func start",
-    "test": "echo \"No test specified\" && exit 0"
-  },
+  "private": true,
+  "main": "chat/index.js",
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "@azure/functions": "^3.0.0",
-    "googleapis": "^126.0.1",
-    "node-fetch": "^2.6.1"
-  },
-  "devDependencies": {},
-  "author": "FTE Team",
-  "license": "MIT"
+    "googleapis": "^131.0.0",
+    "node-fetch": "^2.6.12"
+  }
 }
