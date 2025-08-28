@@ -10,8 +10,8 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: 'chat' # <--- CHANGE THIS LINE from '.' to 'chat'
-  NODE_VERSION: '20' # set this to the node version to use (supports 8.x, 10.x, 12.x )
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: 'chat' # set this to the path to your web app project, defaults to the repository root
+  NODE_VERSION: '20' # Changed from 22 to 20 for Azure Functions compatibility
 
 jobs:
   build:
@@ -38,8 +38,6 @@ jobs:
           popd
 
       - name: Zip artifact for deployment
-        # This line also needs to be updated to zip the 'chat' folder content
-        # Instead of ./* -r, it should be ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/* -r
         run: zip release.zip ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/* -r
 
       - name: Upload artifact for deployment job
@@ -79,8 +77,9 @@ jobs:
         with:
           app-name: 'fte-intake-bot'
           slot-name: 'Production'
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }} # This is already correct
+          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
 
           
+
 
 
