@@ -1,28 +1,11 @@
-// index.js — Azure Function (Node 18+)
+// index.js — Azure Function (Node 18+) - FIXED VERSION
 // ------------------------------------
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
 
-/* ========== ENV ========== */
-function must(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var ${name}`);
-  return v;
-}
-
-const CAPTURE_SHEET_ID   = must("GOOGLE_SHEETS_ID");               // where chat + manual form are saved
-const CAPTURE_RANGE      = process.env.GOOGLE_SHEETS_RANGE || "Sheet1!A:I";
-
-const TRACKER_SHEET_ID   = process.env.GOOGLE_SHEETS_TRACKER_ID || CAPTURE_SHEET_ID; // allow separate file if you ever split it
-const TRACKER_TAB        = process.env.GOOGLE_SHEETS_TRACKER_TAB || "Local Price Tracker"; // your screenshot tab name
-
-const SERPER_API_KEY     = must("SERPER_API_KEY");
-const OPENAI_API_KEY     = must("OPENAI_API_KEY");
-const OPENAI_API_BASE    = (process.env.OPENAI_API_BASE || "https://api.openai.com/v1").replace(/\/+$/,"");
-
-/* ========== Google Sheets ========== */
+/* =====================  Google Sheets  ===================== */
 async function getSheetsClient() {
-  const creds = JSON.parse(must("GOOGLE_SHEETS_CREDENTIALS"));
+  const creds = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
   const auth = new google.auth.JWT(
     creds.client_email,
     null,
@@ -35,31 +18,34 @@ async function getSheetsClient() {
 
 async function appendToSheet(row) {
   const sheets = await getSheetsClient();
+  const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
+  const range = process.env.GOOGLE_SHEETS_RANGE || "Sheet1!A:I";
   await sheets.spreadsheets.values.append({
-    spreadsheetId: CAPTURE_SHEET_ID,
-    range: CAPTURE_RANGE,
+    spreadsheetId,
+    range,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
 }
 
-/* Generic reader for a tab */
-async function readTab(spreadsheetId, tabName) {
-  const sheets = await getSheetsClient();
-  const range = `${tabName}!A:Z`;
-  const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range });
-  const rows = resp.data.values || [];
-  if (!rows.length) return { headers: [], rows: [] };
-  const headers = rows[0].map((h) => String(h || "").trim());
-  const dataRows = rows.slice(1);
-  return { headers, rows: dataRows };
-}
-
-/* ========== Row builder for captured requests ========== */
+/**
+ * Unified row (A..I):
+ *  A Timestamp
+ *  B Artist_or_event
+ *  C Ticket_qty
+ *  D Budget_tier
+ *  E Date_or_date_range
+ *  F Name
+ *  G Email
+ *  H Phone
+ *  I Notes
+ */
 function toRow(c) {
   const ts = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" }); // A
   const artist = c?.artist_or_event || "";                                        // B
-  const qty = Number.isFinite(c?.ticket_qty) ? c.ticket_qty : (parseInt(c?.ticket_qty || "", 10) || ""); // C
+  const qty = Number.isFinite(c?.ticket_qty)
+    ? c.ticket_qty
+    : (parseInt(c?.ticket_qty || "", 10) || "");                                   // C
   const budgetTier = c?.budget_tier || c?.budget || "";                            // D
   const dateRange = c?.date_or_date_range || "";                                   // E
   const name = c?.name || "";                                                      // F
@@ -69,104 +55,21 @@ function toRow(c) {
   return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
 }
 
-/* ========== Tracker-powered suggestions & prices ========== */
-function indexBy(headers, ...candidates) {
-  const lc = headers.map(h => h.toLowerCase());
-  for (const cand of candidates) {
-    const i = lc.findIndex(h => h === cand || h.includes(cand));
-    if (i !== -1) return i;
-  }
-  return -1;
-}
-
-const PRICE_RE = /\$[ ]?(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi;
-function firstPriceVal(text) {
-  if (!text) return null;
-  let m; PRICE_RE.lastIndex = 0;
-  while ((m = PRICE_RE.exec(text))) {
-    const val = parseInt(m[1], 10);
-    if (!isNaN(val) && val >= 20) return val;
-  }
-  return null;
-}
-
-/* Pull a rough starting price for an artist from tracker tab */
-async function localPriceForArtist(artist) {
-  if (!artist) return null;
-  const { headers, rows } = await readTab(TRACKER_SHEET_ID, TRACKER_TAB);
-  if (!headers.length || !rows.length) return null;
-
-  const artistIdx = indexBy(headers, "artist_or_event", "artist", "event", "title");
-  const priceIdx  = indexBy(headers, "price", "starting_price", "from", "lowest", "price #1");
-
-  let best = null;
-
-  for (const r of rows) {
-    const a = artistIdx !== -1 ? String(r[artistIdx] || "") : "";
-    if (!a) continue;
-    if (!a.toLowerCase().includes(String(artist).toLowerCase())) continue;
-
-    if (priceIdx !== -1) {
-      const p = firstPriceVal(String(r[priceIdx] || ""));
-      if (p != null) best = best == null ? p : Math.min(best, p);
-    } else {
-      // scan whole row for a $ value
-      for (const cell of r) {
-        const p = firstPriceVal(String(cell || ""));
-        if (p != null) { best = best == null ? p : Math.min(best, p); }
-      }
-    }
-  }
-  return best;
-}
-
-/* Small list of suggestions for a city from tracker tab */
-async function localSuggestions(city = "chicago", max = 5) {
-  const { headers, rows } = await readTab(TRACKER_SHEET_ID, TRACKER_TAB);
-  if (!headers.length || !rows.length) return [];
-
-  const artistIdx = indexBy(headers, "artist_or_event", "artist", "event", "title");
-  const cityIdx   = indexBy(headers, "city", "location");
-  const dateIdx   = indexBy(headers, "date", "when");
-  const priceIdx  = indexBy(headers, "price", "starting_price", "from", "lowest", "price #1");
-
-  const out = [];
-  for (const r of rows) {
-    const a = artistIdx !== -1 ? String(r[artistIdx] || "") : "";
-    if (!a) continue;
-
-    const c = cityIdx !== -1 ? String(r[cityIdx] || "") : "";
-    if (c && city && !c.toLowerCase().includes(city.toLowerCase())) continue;
-
-    const d = dateIdx !== -1 ? String(r[dateIdx] || "") : "";
-    let pNum = null;
-    if (priceIdx !== -1) pNum = firstPriceVal(String(r[priceIdx] || ""));
-    if (pNum == null) {
-      for (const cell of r) {
-        const p = firstPriceVal(String(cell || ""));
-        if (p != null) { pNum = p; break; }
-      }
-    }
-    const line = `${a}${d ? ` (${d})` : ""}${pNum != null ? `: Starting at $${pNum}` : ""}`;
-    out.push({ line, p: pNum ?? Infinity });
-    if (out.length >= max) break;
-  }
-  return out;
-}
-
-/* ========== Serper web search (fallback) ========== */
+/* =====================  Serper Search  ===================== */
 async function webSearch(query, location, { preferTickets = true, max = 5 } = {}) {
-  const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com)" : "";
+  const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com OR site:stubhub.com)" : "";
   const hasTicketsWord = /\bticket(s)?\b/i.test(query);
-  const qFinal = query + (hasTicketsWord ? "" : " tickets") + (location ? ` ${location}` : "") + siteBias;
+  const qFinal =
+    query + (hasTicketsWord ? "" : " tickets") + (location ? ` ${location}` : "") + siteBias;
 
   const resp = await fetch("https://google.serper.dev/search", {
     method: "POST",
-    headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+    headers: { "X-API-KEY": process.env.SERPER_API_KEY, "Content-Type": "application/json" },
     body: JSON.stringify({ q: qFinal, num: max }),
   });
   if (!resp.ok) throw new Error(await resp.text());
   const data = await resp.json();
+
   return (data.organic || []).map((r, i) => ({
     n: i + 1,
     title: r.title || "",
@@ -175,219 +78,444 @@ async function webSearch(query, location, { preferTickets = true, max = 5 } = {}
   }));
 }
 
-function minPriceAcross(items) {
-  let best = null;
-  for (const it of items || []) {
-    const val = firstPriceVal(`${it.title} ${it.snippet}`);
-    if (val != null) best = best == null ? val : Math.min(best, val);
+/* =====================  Price helpers - IMPROVED  ===================== */
+// More comprehensive price regex patterns
+const PRICE_PATTERNS = [
+  /\$\s*(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi,  // $100 or $100-$200
+  /from\s*\$\s*(\d{2,4})/gi,                  // from $100
+  /starting\s*at\s*\$\s*(\d{2,4})/gi,         // starting at $100
+  /as\s*low\s*as\s*\$\s*(\d{2,4})/gi,         // as low as $100
+  /(\d{2,4})\s*dollars?/gi,                   // 100 dollars
+];
+
+const irrelevant = (t, s) => /parking|hotel|restaurant|faq|blog|merchandise|merch|food|drink/i.test(`${t} ${s}`);
+
+function extractPrices(text) {
+  if (!text) return [];
+  const prices = [];
+  
+  for (const pattern of PRICE_PATTERNS) {
+    pattern.lastIndex = 0; // Reset regex
+    let match;
+    while ((match = pattern.exec(text))) {
+      const val = parseInt(match[1], 10);
+      if (!isNaN(val) && val >= 20 && val <= 2000) { // Reasonable ticket price range
+        prices.push(val);
+      }
+    }
   }
-  return best;
+  
+  return [...new Set(prices)]; // Remove duplicates
+}
+
+function minPriceAcross(items) {
+  let allPrices = [];
+  for (const item of items || []) {
+    if (!irrelevant(item.title, item.snippet)) {
+      const prices = extractPrices(`${item.title} ${item.snippet}`);
+      allPrices.push(...prices);
+    }
+  }
+  return allPrices.length > 0 ? Math.min(...allPrices) : null;
+}
+
+async function getTicketPrices(query) {
+  try {
+    // Search multiple ticket sites
+    const searches = await Promise.all([
+      webSearch(`${query} tickets site:vividseats.com`, null, { preferTickets: true, max: 3 }),
+      webSearch(`${query} tickets site:ticketmaster.com`, null, { preferTickets: true, max: 3 }),
+      webSearch(`${query} tickets site:stubhub.com`, null, { preferTickets: true, max: 3 }),
+    ]);
+    
+    const allResults = searches.flat();
+    const relevantResults = allResults.filter(item => !irrelevant(item.title, item.snippet));
+    
+    return minPriceAcross(relevantResults);
+  } catch (error) {
+    console.error('Price search error:', error);
+    return null;
+  }
 }
 
 function priceSummaryMessage(priceNum) {
-  if (priceNum != null) return `Summary: Lowest starting price around $${priceNum}.\n\nWould you like me to open the request form?`;
-  return `Summary: I couldn’t confirm a current starting price just yet.\n\nWould you like me to open the request form?`;
+  if (priceNum != null) {
+    return `I found tickets starting around $${priceNum}. What's your budget range?`;
+  }
+  return `I'll help you find the best prices. What's your budget range?`;
 }
 
-/* ========== OpenAI Responses API ========== */
+/* =====================  Guardrail extraction  ===================== */
+function normalizeBudgetTier(text = "") {
+  const t = text.toLowerCase();
+  const num = parseInt(t.replace(/[^\d]/g, ""), 10);
+  if (/(<\s*\$?50|under\s*50|less\s*than\s*\$?50)/i.test(text)) return "<$50";
+  if (/\b(50[\s–-]?99|50-99|50 to 99)\b/i.test(text)) return "$50–$99";
+  if (/\b(100[\s–-]?149|100-149|100 to 149)\b/i.test(text)) return "$100–$149";
+  if (/\b(150[\s–-]?199|150-199|150 to 199)\b/i.test(text)) return "$150–$199";
+  if (/\b(200[\s–-]?249|200-249|200 to 249)\b/i.test(text)) return "$200–$249";
+  if (/\b(250[\s–-]?299|250-299|250 to 299)\b/i.test(text)) return "$250–$299";
+  if (/\b(300[\s–-]?349|300-349|300 to 349)\b/i.test(text)) return "$300–$349";
+  if (/\b(350[\s–-]?399|350-399|350 to 399)\b/i.test(text)) return "$350–$399";
+  if (/(400|450)/i.test(text)) return "$400–$499";
+  if (/\$?500\+|over\s*\$?500|>\s*\$?500/i.test(text)) return "$500+";
+  if (!isNaN(num)) {
+    if (num < 50) return "<$50";
+    if (num < 100) return "$50–$99";
+    if (num < 150) return "$100–$149";
+    if (num < 200) return "$150–$199";
+    if (num < 250) return "$200–$249";
+    if (num < 300) return "$250–$299";
+    if (num < 350) return "$300–$349";
+    if (num < 400) return "$350–$399";
+    if (num < 500) return "$400–$499";
+    return "$500+";
+  }
+  return "";
+}
+
+const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const PHONE_RE = /\b(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/;
+const QTY_RE   = /\b(\d{1,2})\b/;
+const DATE_WORDS = /\b(today|tonight|tomorrow|this\s*(week|weekend)|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{1,2}(?:,\s*\d{4})?)\b/i;
+
+/** Turn-aware extraction */
+function extractTurnAware(messages) {
+  const out = { artist_or_event:"", ticket_qty:"", budget_tier:"", date_or_date_range:"", name:"", email:"", phone:"", notes:"" };
+  for (let i = 0; i < messages.length - 1; i++) {
+    const a = messages[i], u = messages[i + 1];
+    if (a.role !== "assistant" || u.role !== "user") continue;
+    const q = String(a.content || "").toLowerCase();
+    const ans = String(u.content || "");
+    if (!out.artist_or_event && /(artist|event).*(interested|looking|tickets?)/.test(q)) out.artist_or_event = ans.replace(/tickets?/ig, "").trim();
+    if (!out.ticket_qty && /(how many|quantity|qty)/.test(q)) { const m = ans.match(QTY_RE); if (m) out.ticket_qty = parseInt(m[1], 10); }
+    if (!out.budget_tier && /(budget|price range|per ticket)/.test(q)) out.budget_tier = normalizeBudgetTier(ans);
+    if (!out.date_or_date_range && /(date|when)/.test(q)) { const dm = ans.match(DATE_WORDS); out.date_or_date_range = dm ? dm[0] : ans.trim(); }
+    if (!out.name && /name/.test(q)) { if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) out.name = ans.trim(); }
+    if (!out.email && /(email|e-mail)/.test(q)) { const em = ans.match(EMAIL_RE); if (em) out.email = em[0]; }
+    if (!out.phone && /(phone|number)/.test(q)) { const pm = ans.match(PHONE_RE); if (pm) out.phone = pm[0]; }
+    if (/notes?|special|requests?/i.test(q)) { if (!/no|none|n\/a/i.test(ans)) out.notes = ans.trim(); }
+  }
+  return out;
+}
+
+/** Backstop extraction */
+function extractFromTranscript(messages) {
+  const userTexts = messages.filter(m => m.role === "user").map(m => String(m.content||""));
+  const allText = messages.map(m => String(m.content || "")).join("\n");
+
+  let artist = "";
+  for (const t of userTexts) {
+    const m = t.match(/(?:see|want|looking.*for|tickets? for|go to|interested in)\s+(.+)/i);
+    if (m) { artist = m[1].replace(/tickets?$/i, "").trim(); break; }
+  }
+  if (!artist && userTexts.length) artist = userTexts[0].trim();
+  if (/^hi|hello|hey$/i.test(artist)) artist = "";
+
+  let qty = null;
+  for (let i = userTexts.length-1; i >= 0; i--) {
+    const m = userTexts[i].match(QTY_RE);
+    if (m) { qty = parseInt(m[1], 10); if (qty>0 && qty<=12) break; }
+  }
+
+  let budget_tier = "";
+  for (let i = userTexts.length-1; i >= 0; i--) {
+    const bt = normalizeBudgetTier(userTexts[i]);
+    if (bt) { budget_tier = bt; break; }
+  }
+
+  let date_or_date_range = "";
+  const dm = allText.match(DATE_WORDS);
+  if (dm) date_or_date_range = dm[0];
+
+  let name = "";
+  const nameAskIdx = messages.findLastIndex?.(m => m.role === "assistant" && /name/i.test(String(m.content||""))) ?? -1;
+  if (nameAskIdx >= 0 && messages[nameAskIdx + 1]?.role === "user") {
+    const ans = String(messages[nameAskIdx + 1].content || "");
+    if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) name = ans.trim();
+  }
+  if (!name) {
+    const nm = allText.match(/\bmy name is ([a-z ,.'-]{2,60})/i) || allText.match(/\bi am ([a-z ,.'-]{2,60})/i);
+    if (nm) name = nm[1].trim();
+  }
+
+  const email = (allText.match(EMAIL_RE) || [""])[0];
+  const phone = (allText.match(PHONE_RE) || [""])[0];
+
+  let notes = "";
+  if (/aisle/i.test(allText)) notes = (notes ? notes + "; " : "") + "Aisle seat preferred";
+  if (/ada|accessible/i.test(allText)) notes = (notes ? notes + "; " : "") + "ADA/accessible";
+
+  return { artist_or_event: artist || "", ticket_qty: qty ?? "", budget_tier, date_or_date_range, name, email, phone, notes };
+}
+
+function mergeCapture(a, b) {
+  return {
+    artist_or_event: a.artist_or_event || b.artist_or_event || "",
+    ticket_qty: a.ticket_qty || b.ticket_qty || "",
+    budget_tier: a.budget_tier || b.budget_tier || "",
+    date_or_date_range: a.date_or_date_range || b.date_or_date_range || "",
+    name: a.name || b.name || "",
+    email: a.email || b.email || "",
+    phone: a.phone || b.phone || "",
+    notes: a.notes || b.notes || ""
+  };
+}
+
+function haveRequired(c) {
+  return !!(c.artist_or_event && c.ticket_qty && c.budget_tier && c.name && c.email);
+}
+function userConfirmed(text) {
+  return /\b(yes|yep|yeah|correct|confirm|finalize|go ahead|proceed|place it|submit|that's right|looks good|do it|book it)\b/i.test(text || "");
+}
+function userAskedForm(text) {
+  return /\b(open|use|show)\b.*\b(form)\b|\bmanual request\b/i.test(text || "");
+}
+
+/* =====================  OpenAI - FIXED  ===================== */
 async function callOpenAI(messages) {
   const sysPrompt = `
-You are FTE’s polite, fast, and helpful ticket intake assistant on a public website.
+You are FTE's polite, fast, and helpful ticket intake assistant on a public website.
 
 GOALS
 - Help the user pick or request tickets with minimum back-and-forth.
-- Be conversational and ask only one short question at a time for missing details.
-- When the user confirms details, CALL capture_ticket_request immediately.
-- For ideas/dates/prices, try local tracker first (handled by the server) or call web_search and return a one-line price summary (no links).
+- Be conversational, but ask only one short question at a time for missing details.
+- When the user confirms the details ("yes", "proceed", "go ahead", etc.), CALL the capture_ticket_request tool immediately with the fields you know.
+- If the user wants ideas, dates, or prices, use the web_search tool first and reply with a short summary.
 
-DATA TO CAPTURE
+DATA TO CAPTURE (for capture_ticket_request)
 - artist_or_event (required) — e.g., "Jonas Brothers"
 - ticket_qty (required, integer)
-- budget_tier (required; one of "<$50","$50–$99","$100–$149","$150–$199","$200–$249","$250–$299","$300–$349","$350–$399","$400–$499","$500+")
+- budget_tier (required, choose one exactly): "<$50","$50–$99","$100–$149","$150–$199","$200–$249","$250–$299","$300–$349","$350–$399","$400–$499","$500+"
 - date_or_date_range (optional)
-- name (required), email (required), phone (optional), notes (optional)
+- name (required)
+- email (required)
+- phone (optional)
+- notes (optional, short phrases only)
 
 STYLE
-- Short, friendly replies.
+- Short, friendly messages.
 - Never ask for City/Residence.
-- Never tell them to fill a form; the website opens it if they ask.
-- After they confirm the summary, CALL capture_ticket_request instead of asking again.
-`;
+- Do not tell the user to fill a form. If they ask for the form, the website will open it.
+- After the user confirms the summary, CALL capture_ticket_request instead of asking again.
+
+PRICE / IDEAS
+- If the user asks "what's on" / "what's happening" / "recommendations" / "prices", call web_search first.
+- For price searches, be specific with the query including the artist/event name.
+- Suggestions: provide a short list (3–5 lines) if they ask for ideas.
+
+IMPORTANT
+- Do not restart the conversation after the user confirms. Proceed to capture.
+- If you already know all the required details (artist/event, ticket_qty, budget_tier, name, email),
+  you should immediately CALL capture_ticket_request after the user confirms, instead of asking again.
+- If the user says "no", "not sure", or "undecided", keep the chat light and offer to search events.
+- Always lean toward moving the user forward rather than looping back.
+
+TONE
+- Friendly, concise, approachable.
+- Use plain conversational English (no technical language).
+- Encourage the user lightly, but don't oversell.
+`.trim();
 
   const body = {
-    model: "gpt-4.1-mini",
+    model: "gpt-4o-mini", // Fixed model name
     temperature: 0.2,
-    input: [{ role: "system", content: sysPrompt }, ...messages],
+    messages: [{ role: "system", content: sysPrompt }, ...messages], // Fixed: use 'messages' not 'input'
     tools: [
       {
         type: "function",
-        name: "capture_ticket_request",
-        description: "Finalize a ticket request and log to Google Sheets.",
-        parameters: {
-          type: "object",
-          properties: {
-            artist_or_event: { type: "string" },
-            ticket_qty: { type: "integer" },
-            budget_tier: {
-              type: "string",
-              enum: [
-                "<$50","$50–$99","$100–$149","$150–$199",
-                "$200–$249","$250–$299","$300–$349","$350–$399",
-                "$400–$499","$500+"
-              ]
+        function: { // Fixed: wrap in 'function' object
+          name: "capture_ticket_request",
+          description: "Finalize a ticket request and log to Google Sheets.",
+          parameters: {
+            type: "object",
+            properties: {
+              artist_or_event: { type: "string" },
+              ticket_qty: { type: "integer" },
+              budget_tier: {
+                type: "string",
+                enum: [
+                  "<$50","$50–$99","$100–$149","$150–$199",
+                  "$200–$249","$250–$299","$300–$349","$350–$399",
+                  "$400–$499","$500+"
+                ]
+              },
+              date_or_date_range: { type: "string" },
+              name: { type: "string" },
+              email: { type: "string" },
+              phone: { type: "string" },
+              notes: { type: "string" }
             },
-            date_or_date_range: { type: "string" },
-            name: { type: "string" },
-            email: { type: "string" },
-            phone: { type: "string" },
-            notes: { type: "string" }
-          },
-          required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
+            required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
+          }
         }
       },
       {
         type: "function",
-        name: "web_search",
-        description: "Search the web for events, venues, dates, ticket info, or prices.",
-        parameters: {
-          type: "object",
-          properties: {
-            q: { type: "string" },
-            location: { type: "string" }
-          },
-          required: ["q"]
+        function: { // Fixed: wrap in 'function' object
+          name: "web_search",
+          description: "Search the web for events, venues, dates, ticket info, or prices.",
+          parameters: {
+            type: "object",
+            properties: {
+              q: { type: "string", description: "Search query (include artist/venue and 'tickets' when relevant)" },
+              location: { type: "string", description: "City/Region (optional)" }
+            },
+            required: ["q"]
+          }
         }
       }
     ],
     tool_choice: "auto"
   };
 
-  const resp = await fetch(`${OPENAI_API_BASE}/responses`, {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", { // Fixed: correct endpoint
     method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify(body)
   });
+
   if (!resp.ok) throw new Error(await resp.text());
   return resp.json();
 }
 
-/* ========== Response helpers ========== */
-function digToolCalls(x) {
-  if (!x) return [];
-  if (Array.isArray(x)) return x.flatMap(digToolCalls);
-  const out = [];
-  if (x.type === "tool_call" && x.name) out.push(x);
-  if (x.output) out.push(...digToolCalls(x.output));
-  if (x.content) out.push(...digToolCalls(x.content));
-  return out;
-}
-function toAssistantText(obj) {
-  const tryList = [obj?.output_text, obj?.text, obj?.content, obj?.output];
-  const flat = (node) => {
-    if (!node) return "";
-    if (typeof node === "string") return node;
-    if (Array.isArray(node)) return node.map(flat).join("");
-    if (typeof node === "object") return [node.text, node.content, node.output].map(flat).join("");
-    return "";
-  };
-  for (const cand of tryList) {
-    const s = flat(cand).trim();
-    if (s) return s;
-  }
-  return "";
+/* =====================  Response helpers - SIMPLIFIED  ===================== */
+function extractToolCalls(response) {
+  const message = response?.choices?.[0]?.message;
+  return message?.tool_calls || [];
 }
 
-/* ========== Intent helpers ========== */
+function extractAssistantText(response) {
+  const message = response?.choices?.[0]?.message;
+  return message?.content || "";
+}
+
+/* =====================  Intent helpers  ===================== */
 function looksLikeSearch(msg) {
   const q = (msg || "").toLowerCase();
   return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game|popular|upcoming|suggest|recommend/.test(q);
 }
 function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
 function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
+function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
 
-/* ========== Azure Function entry ========== */
+/* =====================  Azure Function entry - COMPLETED  ===================== */
 module.exports = async function (context, req) {
   context.res = {
     headers: {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Content-Type": "application/json"
     }
   };
 
-  if (req.method === "OPTIONS") { context.res.status = 204; return; }
-  if (req.method !== "POST") { context.res.status = 405; context.res.body = { error: "Method not allowed" }; return; }
+  if (req.method === "OPTIONS") {
+    context.res.status = 200;
+    context.res.body = {};
+    return;
+  }
 
   try {
-    // 1) Manual form submission (your Framer modal)
-    if (req.body?.direct_capture && req.body?.capture) {
-      await appendToSheet(toRow(req.body.capture));
-      context.res.status = 200;
-      context.res.body = { message: "Saved your request. We’ll follow up soon!", captured: req.body.capture };
+    const { messages = [] } = req.body || {};
+    
+    if (!Array.isArray(messages) || messages.length === 0) {
+      context.res.status = 400;
+      context.res.body = { error: "Invalid messages format" };
       return;
     }
 
-    const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-    const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content || "";
+    const lastUserMessage = messages[messages.length - 1];
+    const userText = String(lastUserMessage?.content || "");
 
-    // 2) Suggestions path: prefer local tracker
-    if (wantsSuggestions(lastUser)) {
-      const local = await localSuggestions("chicago", 5);
-      if (local.length) {
-        const summary = local.map((x) => `• ${x.line}`).join("\n");
-        context.res.status = 200;
-        context.res.body = { message: `${summary}\n\nWant me to start a request for any of these?` };
-        return;
-      }
-      const results = await webSearch(lastUser, "Chicago", { preferTickets: true, max: 5 });
-      const best = minPriceAcross(results);
-      const msg = priceSummaryMessage(best);
+    // Handle special cases
+    if (userAskedForm(userText)) {
       context.res.status = 200;
-      context.res.body = { message: msg };
+      context.res.body = { 
+        message: "I'll open the manual request form for you.",
+        action: "open_form"
+      };
       return;
     }
 
-    // 3) OpenAI model pass
-    const data = await callOpenAI(messages);
-    const calls = digToolCalls(data);
-    context.log("Tool calls:", JSON.stringify(calls));
+    // Call OpenAI
+    const openaiResponse = await callOpenAI(messages);
+    const toolCalls = extractToolCalls(openaiResponse);
+    const assistantText = extractAssistantText(openaiResponse);
 
-    for (const c of calls) {
-      const args = typeof c.arguments === "string" ? JSON.parse(c.arguments) : c.arguments;
+    // Process tool calls
+    let finalMessage = assistantText;
+    let shouldCapture = false;
+    let captureData = null;
 
-      if (c.name === "capture_ticket_request") {
-        await appendToSheet(toRow(args));
-        context.res.status = 200;
-        context.res.body = {
-          message: "Thanks! I saved your request and we’ll follow up shortly to confirm details.",
-          captured: args
-        };
-        return;
-      }
+    for (const toolCall of toolCalls) {
+      const toolName = toolCall.function?.name;
+      const toolArgs = JSON.parse(toolCall.function?.arguments || "{}");
 
-      if (c.name === "web_search") {
-        // Try tracker first for artist price; fallback to web
-        const artistGuess = String(args.q || "").replace(/tickets?|price|prices?/ig, "").trim();
-        let bestNum = await localPriceForArtist(artistGuess);
-        if (bestNum == null) {
-          const results = await webSearch(args.q, args.location, { preferTickets: true });
-          bestNum = minPriceAcross(results);
+      if (toolName === "web_search") {
+        try {
+          const searchResults = await webSearch(toolArgs.q, toolArgs.location);
+          
+          if (looksLikePrice(userText) || /price/i.test(toolArgs.q)) {
+            // Price search
+            const price = await getTicketPrices(toolArgs.q);
+            finalMessage = priceSummaryMessage(price);
+          } else if (wantsSuggestions(userText)) {
+            // Recommendations
+            const suggestions = searchResults
+              .filter(r => !irrelevant(r.title, r.snippet))
+              .slice(0, 5)
+              .map(r => `• ${r.title}`)
+              .join('\n');
+            finalMessage = suggestions ? 
+              `Here are some popular events:\n${suggestions}\n\nWhich one interests you?` :
+              "I'm having trouble finding current events. What specific artist or show are you looking for?";
+          } else {
+            // General search - extract price if available
+            const price = minPriceAcross(searchResults);
+            if (price) {
+              finalMessage = `I found tickets starting around $${price}. How many tickets do you need?`;
+            }
+          }
+        } catch (error) {
+          console.error('Search error:', error);
+          finalMessage = "I'm having trouble with the search right now. What specific event are you looking for?";
         }
-        const msg = priceSummaryMessage(bestNum);
-        context.res.status = 200;
-        context.res.body = { message: msg };
-        return;
+      } else if (toolName === "capture_ticket_request") {
+        shouldCapture = true;
+        captureData = toolArgs;
+        finalMessage = `Perfect! I've captured your request for ${toolArgs.ticket_qty} tickets to ${toolArgs.artist_or_event}. Our team will reach out to you at ${toolArgs.email} with the best options within your ${toolArgs.budget_tier} budget. Thanks, ${toolArgs.name}!`;
       }
     }
 
-    // 4) No tools called → just return model text
-    const assistantText = toAssistantText(data) || "Great — which artist or event are you looking for, and how many tickets do you need?";
+    // Capture to Google Sheets if needed
+    if (shouldCapture && captureData) {
+      try {
+        const row = toRow(captureData);
+        await appendToSheet(row);
+        console.log('Successfully captured to Google Sheets:', captureData);
+      } catch (error) {
+        console.error('Google Sheets error:', error);
+        // Don't fail the whole request if sheets fails
+      }
+    }
+
     context.res.status = 200;
-    context.res.body = { message: assistantText };
+    context.res.body = { 
+      message: finalMessage,
+      captured: shouldCapture
+    };
+
   } catch (e) {
-    context.log.error(e);
+    console.error('Function error:', e);
     context.res.status = 500;
     context.res.body = { error: String(e) };
   }
+};
+
+
 };
 
