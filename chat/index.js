@@ -1,9 +1,9 @@
-const { AzureFunction } = require('@azure/functions');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
+const fetch = require('node-fetch');
 
-// Google Sheets configuration
-const SHEET_ID = '1KY-O6F-6rwSUsCvfQGQaADu985jTDCUJN4Oc0zKpiBA';
+// Google Sheets configuration using your environment variables
+const SHEET_ID = process.env.GOOGLE_SHEETS_ID || '1KY-O6F-6rwSUsCvfQGQaADu985jTDCUJN4Oc0zKpiBA';
 const TAB_NAME = 'Local Price Tracker';
 
 // Cache for Google Sheets data (30 minutes)
@@ -13,12 +13,21 @@ let sheetsCache = {
     ttl: 30 * 60 * 1000 // 30 minutes
 };
 
-// Initialize Google Sheets client
+// Cache for search results (30 minutes)
+let searchCache = {
+    data: new Map(),
+    ttl: 30 * 60 * 1000 // 30 minutes
+};
+
+// Initialize Google Sheets client using your credentials format
 async function initializeGoogleSheets() {
     try {
+        // Parse the credentials JSON from your environment variable
+        const credentials = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
+        
         const serviceAccountAuth = new JWT({
-            email: process.env.GOOGLE_SHEETS_CLIENT_EMAIL,
-            key: process.env.GOOGLE_SHEETS_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+            email: credentials.client_email,
+            key: credentials.private_key.replace(/\\n/g, '\n'),
             scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
         });
 
@@ -89,7 +98,7 @@ function getCurrentPrice(row) {
     return null;
 }
 
-// Enhanced performance search with web search fallback
+// Enhanced performance search with database first, web search fallback
 async function searchArtistPerformances(artistQuery) {
     try {
         const events = await loadEventsData();
@@ -98,150 +107,166 @@ async function searchArtistPerformances(artistQuery) {
         const matches = events.filter(event => {
             const artist = event.artist.toLowerCase();
             // More flexible matching
-            return artist.includes(query) || 
-                   query.includes(artist) ||
-                   // Handle partial matches
-                   artist.split(/[-\s]+/).some(word => query.includes(word)) ||
-                   query.split(/[-\s]+/).some(word => artist.includes(word));
+            return artist.includes(query) || query.includes(artist) || 
+                   artist.split(' ').some(word => query.includes(word)) ||
+                   query.split(' ').some(word => artist.includes(word));
         });
 
-        return matches.sort((a, b) => new Date(a.date) - new Date(b.date));
+        if (matches.length > 0) {
+            const match = matches[0];
+            return {
+                artist: match.artist,
+                isPerforming: true,
+                date: match.date,
+                venue: match.venue,
+                vividLink: match.vividLink,
+                source: 'database'
+            };
+        }
+
+        // Fallback to web search if not found in database
+        const webResult = await getPerformanceWebFallback(artistQuery);
+        return webResult;
     } catch (error) {
         console.error('Error searching artist performances:', error);
-        return [];
+        // Fallback to web search on error
+        return await getPerformanceWebFallback(artistQuery);
     }
 }
 
-// Web search fallback for performance queries
-async function searchPerformanceWebFallback(artistQuery) {
+// Web search fallback for artist performances
+async function getPerformanceWebFallback(artistQuery) {
     try {
-        const searchQuery = `${artistQuery} chicago concerts 2025 tickets`;
+        const query = `${artistQuery} Chicago concert tour dates 2024 2025`;
+        
         const response = await fetch(`https://google.serper.dev/search`, {
             method: 'POST',
             headers: {
                 'X-API-KEY': process.env.SERPER_API_KEY,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                q: searchQuery,
-                num: 5
+                q: query,
+                num: 10
             })
         });
 
         if (!response.ok) {
-            return null;
+            throw new Error(`Serper API error: ${response.status}`);
         }
 
         const data = await response.json();
-        
-        // Extract performance information from search results
         const results = data.organic || [];
-        let performanceInfo = '';
-
+        
         for (const result of results) {
-            const title = result.title.toLowerCase();
-            const snippet = result.snippet.toLowerCase();
+            const title = result.title || '';
+            const snippet = result.snippet || '';
             
-            // Look for date patterns and venue information
-            const datePattern = /(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{1,2}|\d{1,2}\/\d{1,2}\/\d{4}/i;
-            const venuePattern = /(united center|soldier field|wrigley field|allstate arena|chicago theatre|house of blues)/i;
-            
-            const dateMatch = (title + ' ' + snippet).match(datePattern);
-            const venueMatch = (title + ' ' + snippet).match(venuePattern);
-            
-            if (dateMatch || venueMatch) {
-                performanceInfo = `Based on my research, ${artistQuery} appears to have upcoming shows in Chicago`;
-                if (dateMatch) performanceInfo += ` around ${dateMatch[0]}`;
-                if (venueMatch) performanceInfo += ` at ${venueMatch[0]}`;
-                performanceInfo += '. This information might not be 100% accurate, so I recommend checking official sources.';
-                break;
+            if ((title.toLowerCase().includes('chicago') || snippet.toLowerCase().includes('chicago')) &&
+                (title.toLowerCase().includes(artistQuery.toLowerCase()) || 
+                 snippet.toLowerCase().includes(artistQuery.toLowerCase()))) {
+                
+                // Try to extract date information
+                const dateMatch = snippet.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}|\b\d{1,2}\/\d{1,2}\/\d{2,4}|\b\d{4}-\d{2}-\d{2}/i);
+                const venueMatch = snippet.match(/(United Center|Soldier Field|Wrigley Field|Chicago Theatre|Aragon Ballroom)/i);
+                
+                return {
+                    artist: artistQuery,
+                    isPerforming: true,
+                    date: dateMatch ? dateMatch[0] : 'Date TBD',
+                    venue: venueMatch ? venueMatch[0] : 'Venue TBD',
+                    source: 'web search'
+                };
             }
         }
-
-        return performanceInfo || `I found some search results for ${artistQuery} in Chicago, but couldn't extract specific performance details. This might not be 100% accurate, but there may be upcoming shows.`;
+        
+        return {
+            artist: artistQuery,
+            isPerforming: false,
+            date: null,
+            venue: null,
+            source: 'web search'
+        };
     } catch (error) {
-        console.error('Error with web search fallback:', error);
+        console.error('Error with performance web search fallback:', error);
         return null;
     }
 }
 
-// Enhanced event recommendations with better date filtering and pagination
+// Enhanced event recommendations with database first, web search fallback
 async function getEventRecommendations(dateFilter = null, offset = 0, limit = 3) {
     try {
         const events = await loadEventsData();
+        
+        // Filter events by date if specified
         let filteredEvents = events;
-
         if (dateFilter) {
             const now = new Date();
-            let startDate, endDate;
-
-            if (dateFilter.includes('weekend') || dateFilter.includes('this weekend')) {
-                // Get upcoming weekend (Friday to Sunday)
-                const today = new Date();
-                const dayOfWeek = today.getDay();
-                const daysUntilFriday = dayOfWeek <= 5 ? (5 - dayOfWeek) : (7 - dayOfWeek + 5);
-                startDate = new Date(today);
-                startDate.setDate(today.getDate() + daysUntilFriday);
-                endDate = new Date(startDate);
-                endDate.setDate(startDate.getDate() + 2); // Friday to Sunday
-            } else if (dateFilter.includes('next weekend')) {
-                // Next weekend (7 days later)
-                const today = new Date();
-                const dayOfWeek = today.getDay();
-                const daysUntilNextFriday = dayOfWeek <= 5 ? (5 - dayOfWeek + 7) : (7 - dayOfWeek + 5 + 7);
-                startDate = new Date(today);
-                startDate.setDate(today.getDate() + daysUntilNextFriday);
-                endDate = new Date(startDate);
-                endDate.setDate(startDate.getDate() + 2);
-            } else if (dateFilter.includes('week') || dateFilter.includes('this week')) {
-                // Next 7 days
-                startDate = new Date();
-                endDate = new Date();
-                endDate.setDate(startDate.getDate() + 7);
-            } else if (dateFilter.includes('month') || dateFilter.includes('this month')) {
-                // Next 30 days
-                startDate = new Date();
-                endDate = new Date();
-                endDate.setDate(startDate.getDate() + 30);
-            } else if (dateFilter.includes('tonight') || dateFilter.includes('today')) {
-                // Today only
-                startDate = new Date();
-                endDate = new Date();
-                endDate.setDate(startDate.getDate() + 1);
-            } else {
-                // Default to next 14 days
-                startDate = new Date();
-                endDate = new Date();
-                endDate.setDate(startDate.getDate() + 14);
-            }
-
-            filteredEvents = events.filter(event => {
-                const eventDate = new Date(event.date);
-                return eventDate >= startDate && eventDate <= endDate;
-            });
-        } else {
-            // Default: upcoming events (next 30 days)
-            const startDate = new Date();
-            const endDate = new Date();
-            endDate.setDate(startDate.getDate() + 30);
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
             
             filteredEvents = events.filter(event => {
                 const eventDate = new Date(event.date);
-                return eventDate >= startDate && eventDate <= endDate;
+                
+                if (dateFilter === 'weekend') {
+                    const nextSaturday = new Date(today);
+                    nextSaturday.setDate(today.getDate() + (6 - today.getDay()));
+                    const nextSunday = new Date(nextSaturday);
+                    nextSunday.setDate(nextSaturday.getDate() + 1);
+                    
+                    return eventDate >= nextSaturday && eventDate <= nextSunday;
+                } else if (dateFilter === 'tonight') {
+                    return eventDate.toDateString() === today.toDateString();
+                } else if (dateFilter === 'tomorrow') {
+                    const tomorrow = new Date(today);
+                    tomorrow.setDate(today.getDate() + 1);
+                    return eventDate.toDateString() === tomorrow.toDateString();
+                }
+                
+                return true;
             });
         }
 
-        // Sort by date and apply pagination
-        const sortedEvents = filteredEvents.sort((a, b) => new Date(a.date) - new Date(b.date));
-        const paginatedEvents = sortedEvents.slice(offset, offset + limit);
+        // Sort by date (upcoming first)
+        filteredEvents.sort((a, b) => new Date(a.date) - new Date(b.date));
         
-        return {
-            events: paginatedEvents,
-            total: sortedEvents.length,
-            hasMore: (offset + limit) < sortedEvents.length
-        };
+        // Apply pagination
+        const paginatedEvents = filteredEvents.slice(offset, offset + limit);
+        const hasMore = filteredEvents.length > offset + limit;
+
+        if (paginatedEvents.length > 0) {
+            const eventList = paginatedEvents.map((event, index) => 
+                `${offset + index + 1}. ${event.artist} at ${event.venue} on ${event.date}${event.currentPrice ? ` - from $${event.currentPrice}` : ''}`
+            ).join('\n');
+
+            return {
+                events: [`Here are some upcoming events in Chicago from our database:\n\n${eventList}${hasMore ? '\n\nWould you like to see more events?' : ''}`],
+                total: filteredEvents.length,
+                hasMore: hasMore
+            };
+        }
+
+        // Fallback to web search if no database results
+        const webResult = await getRecommendationsWebFallback(dateFilter);
+        if (webResult) {
+            return {
+                events: [webResult],
+                total: 1,
+                hasMore: false
+            };
+        }
+
+        return { events: [], total: 0, hasMore: false };
     } catch (error) {
         console.error('Error getting event recommendations:', error);
+        // Fallback to web search on error
+        const webResult = await getRecommendationsWebFallback(dateFilter);
+        if (webResult) {
+            return {
+                events: [webResult],
+                total: 1,
+                hasMore: false
+            };
+        }
         return { events: [], total: 0, hasMore: false };
     }
 }
@@ -249,29 +274,24 @@ async function getEventRecommendations(dateFilter = null, offset = 0, limit = 3)
 // Web search fallback for recommendations
 async function getRecommendationsWebFallback(dateFilter = null) {
     try {
-        let searchQuery = 'chicago concerts events ';
-        if (dateFilter && dateFilter.includes('weekend')) {
-            searchQuery += 'this weekend';
-        } else if (dateFilter && dateFilter.includes('week')) {
-            searchQuery += 'this week';
-        } else {
-            searchQuery += 'upcoming';
-        }
-        
+        const query = dateFilter ? 
+            `Chicago events ${dateFilter} concerts shows tickets` : 
+            'Chicago events this weekend concerts shows tickets';
+            
         const response = await fetch(`https://google.serper.dev/search`, {
             method: 'POST',
             headers: {
                 'X-API-KEY': process.env.SERPER_API_KEY,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                q: searchQuery,
+                q: query,
                 num: 10
             })
         });
 
         if (!response.ok) {
-            return null;
+            throw new Error(`Serper API error: ${response.status}`);
         }
 
         const data = await response.json();
@@ -280,15 +300,14 @@ async function getRecommendationsWebFallback(dateFilter = null) {
         let recommendations = 'Based on my research, here are some upcoming events in Chicago:\n\n';
         let eventCount = 0;
         
-        for (const result of results.slice(0, 5)) {
-            const title = result.title;
-            const snippet = result.snippet;
+        for (const result of results) {
+            const title = result.title || '';
+            const snippet = result.snippet || '';
             
-            // Look for event-like content
-            if (title.toLowerCase().includes('concert') || 
-                title.toLowerCase().includes('show') || 
-                title.toLowerCase().includes('event') ||
-                snippet.toLowerCase().includes('tickets')) {
+            if ((title.toLowerCase().includes('chicago') || snippet.toLowerCase().includes('chicago')) &&
+                (title.toLowerCase().includes('concert') || title.toLowerCase().includes('show') || 
+                 title.toLowerCase().includes('event') || snippet.toLowerCase().includes('event') ||
+                 snippet.toLowerCase().includes('tickets'))) {
                 eventCount++;
                 recommendations += `${eventCount}. ${title}\n`;
                 if (eventCount >= 3) break;
@@ -307,137 +326,186 @@ async function getRecommendationsWebFallback(dateFilter = null) {
     }
 }
 
-// Simplified price search using only Vivid Seats links from Google Sheets
-async function getPriceFromDatabase(artistQuery) {
+// Enhanced price search using database first, then Vivid Seats link
+async function getPriceFromVividSeats(artistQuery, venue = null) {
     try {
         const events = await loadEventsData();
         const query = artistQuery.toLowerCase().trim();
         
+        // First, try to find in database
         const matches = events.filter(event => {
             const artist = event.artist.toLowerCase();
-            return artist.includes(query) || 
-                   query.includes(artist) ||
-                   artist.split(/[-\s]+/).some(word => query.includes(word)) ||
-                   query.split(/[-\s]+/).some(word => artist.includes(word));
+            const eventVenue = event.venue ? event.venue.toLowerCase() : '';
+            
+            const artistMatch = artist.includes(query) || query.includes(artist) || 
+                               artist.split(' ').some(word => query.includes(word)) ||
+                               query.split(' ').some(word => artist.includes(word));
+            
+            const venueMatch = !venue || eventVenue.includes(venue.toLowerCase()) || 
+                              venue.toLowerCase().includes(eventVenue);
+            
+            return artistMatch && venueMatch;
         });
 
         if (matches.length > 0) {
-            const event = matches[0]; // Get the first match
+            const match = matches[0];
             
-            // Only use the Vivid Seats link from column F
-            if (event.vividLink) {
-                const price = await getPriceFromVividSeats(event.vividLink);
-                if (price) {
+            // If we have a current price from database, use it
+            if (match.currentPrice) {
+                return {
+                    price: parseFloat(match.currentPrice.replace(/[^0-9.]/g, '')),
+                    source: 'our database',
+                    url: match.vividLink
+                };
+            }
+            
+            // If we have a Vivid Seats link, scrape the current price
+            if (match.vividLink) {
+                const scrapedPrice = await scrapeVividSeatsPrice(match.vividLink);
+                if (scrapedPrice) {
                     return {
-                        price: price,
-                        source: 'vivid_seats',
-                        event: event
+                        price: scrapedPrice,
+                        source: 'Vivid Seats',
+                        url: match.vividLink
                     };
                 }
             }
-            
-            return {
-                price: null,
-                source: 'vivid_seats',
-                event: event
-            };
         }
-        
-        return null;
+
+        // Fallback to web search
+        return await getPriceWebFallback(artistQuery, venue);
     } catch (error) {
         console.error('Error getting price from database:', error);
-        return null;
+        // Fallback to web search on error
+        return await getPriceWebFallback(artistQuery, venue);
     }
 }
 
-// Web search fallback for pricing
-async function getPriceWebFallback(artistQuery) {
+// Scrape price from Vivid Seats link (simplified version using search)
+async function scrapeVividSeatsPrice(vividLink) {
     try {
-        const searchQuery = `${artistQuery} chicago tickets price vivid seats`;
+        // Extract event info from Vivid Seats URL for search
+        const urlParts = vividLink.split('/');
+        const eventSlug = urlParts[urlParts.length - 1] || urlParts[urlParts.length - 2];
+        
+        const query = `site:vividseats.com ${eventSlug.replace(/-/g, ' ')} tickets price`;
+        
         const response = await fetch(`https://google.serper.dev/search`, {
             method: 'POST',
             headers: {
                 'X-API-KEY': process.env.SERPER_API_KEY,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                q: searchQuery,
-                num: 5
+                q: query,
+                num: 3
             })
         });
 
         if (!response.ok) {
-            return null;
+            throw new Error(`Serper API error: ${response.status}`);
         }
 
         const data = await response.json();
         const results = data.organic || [];
         
         for (const result of results) {
-            const title = result.title.toLowerCase();
-            const snippet = result.snippet.toLowerCase();
-            const content = title + ' ' + snippet;
+            const snippet = result.snippet || '';
+            const title = result.title || '';
             
-            // Look for price patterns
+            // Multiple price extraction patterns
             const pricePatterns = [
-                /get in for \$(\d+)/i,
-                /starting at \$(\d+)/i,
+                /\$(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/g,
                 /from \$(\d+)/i,
+                /starting at \$(\d+)/i,
                 /tickets from \$(\d+)/i,
-                /\$(\d+)\+/,
-                /price.*\$(\d+)/i
+                /get in \$(\d+)/i
             ];
-
+            
             for (const pattern of pricePatterns) {
-                const match = content.match(pattern);
-                if (match && match[1]) {
-                    return `$${match[1]}`;
+                const matches = [...(snippet + ' ' + title).matchAll(pattern)];
+                if (matches.length > 0) {
+                    const prices = matches.map(match => parseFloat(match[1].replace(',', '')));
+                    return Math.min(...prices);
                 }
             }
         }
         
         return null;
     } catch (error) {
-        console.error('Error with price web search fallback:', error);
+        console.error('Error scraping Vivid Seats price:', error);
         return null;
     }
 }
-async function getPriceFromVividSeats(vividLink) {
+
+// Web search fallback for pricing
+async function getPriceWebFallback(artistQuery, venue = null) {
     try {
-        if (!vividLink || vividLink.trim() === '') {
-            return null;
+        const cacheKey = `price_${artistQuery.toLowerCase()}_${venue || ''}`;
+        const cached = searchCache.data.get(cacheKey);
+        
+        if (cached && (Date.now() - cached.timestamp) < searchCache.ttl) {
+            return cached.data;
         }
 
-        const response = await fetch(vividLink, {
+        const query = venue ? 
+            `site:vividseats.com ${artistQuery} ${venue} tickets` :
+            `site:vividseats.com ${artistQuery} Chicago tickets`;
+            
+        const response = await fetch(`https://google.serper.dev/search`, {
+            method: 'POST',
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+                'X-API-KEY': process.env.SERPER_API_KEY,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                q: query,
+                num: 5
+            })
         });
 
         if (!response.ok) {
-            return null;
+            throw new Error(`Serper API error: ${response.status}`);
         }
 
-        const html = await response.text();
+        const data = await response.json();
+        const results = data.organic || [];
         
-        // Multiple price extraction patterns for Vivid Seats
-        const pricePatterns = [
-            /get in for \$(\d+)/i,
-            /starting at \$(\d+)/i,
-            /from \$(\d+)/i,
-            /\$(\d+)\+/,
-            /"price":\s*"?\$?(\d+)/i,
-            /data-price="(\d+)"/i,
-            /price-value[^>]*>\$(\d+)/i
-        ];
-
-        for (const pattern of pricePatterns) {
-            const match = html.match(pattern);
-            if (match && match[1]) {
-                return `$${match[1]}`;
+        for (const result of results) {
+            const snippet = result.snippet || '';
+            const title = result.title || '';
+            
+            // Multiple price extraction patterns
+            const pricePatterns = [
+                /\$(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/g,
+                /from \$(\d+)/i,
+                /starting at \$(\d+)/i,
+                /tickets from \$(\d+)/i,
+                /get in \$(\d+)/i
+            ];
+            
+            for (const pattern of pricePatterns) {
+                const matches = [...(snippet + ' ' + title).matchAll(pattern)];
+                if (matches.length > 0) {
+                    const prices = matches.map(match => parseFloat(match[1].replace(',', '')));
+                    const minPrice = Math.min(...prices);
+                    
+                    const result = {
+                        price: minPrice,
+                        source: 'Vivid Seats',
+                        url: result.link
+                    };
+                    
+                    searchCache.data.set(cacheKey, {
+                        data: result,
+                        timestamp: Date.now()
+                    });
+                    
+                    return result;
+                }
             }
         }
-
+        
         return null;
     } catch (error) {
         console.error('Error getting price from Vivid Seats:', error);
@@ -445,182 +513,132 @@ async function getPriceFromVividSeats(vividLink) {
     }
 }
 
-// Enhanced OpenAI chat completion with Google Sheets integration
+// OpenAI Chat Completion
 async function getChatCompletion(messages) {
-    const systemPrompt = `You are a helpful ticket assistant for Fair Ticket Exchange. You help customers find tickets for events in the Chicago area.
-
-IMPORTANT QUERY CLASSIFICATION:
-1. PERFORMANCE QUERIES: "does X play", "is X performing", "when is X playing" → Use searchArtistPerformances()
-2. PRICE QUERIES: "what's the price", "how much", "cost of tickets" → Use getPriceFromDatabase() 
-3. RECOMMENDATION QUERIES: "recommendations", "what's happening", "events this weekend" → Use getEventRecommendations()
-
-RESPONSE GUIDELINES:
-- For performance queries: Answer if/when they're performing, include date and venue
-- For price queries: Provide the price from our database or Vivid Seats
-- For recommendations: List 3 events at a time with pagination
-- Always be conversational and helpful
-- If you can't find info in database, offer to do research with disclaimer about accuracy
-
-CONVERSATION FLOW:
-1. Greet and ask how you can help
-2. Classify their query type
-3. Search database first
-4. If not found, offer research with accuracy disclaimer
-5. Collect ticket details: artist/event, quantity, budget, date preference
-6. Get contact info: name, email, phone (optional)
-7. Confirm details and submit to Google Sheets
-
-Budget ranges: "<$50", "$50–$99", "$100–$149", "$150–$199", "$200–$249", "$250–$299", "$300–$349", "$350–$399", "$400–$499", "$500+"`;
-
     try {
         const response = await fetch(`${process.env.OPENAI_API_BASE}/v1/chat/completions`, {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
             },
             body: JSON.stringify({
                 model: 'gpt-4',
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    ...messages
-                ],
+                messages: messages,
                 max_tokens: 500,
                 temperature: 0.7
             })
         });
 
         if (!response.ok) {
-            throw new Error(`OpenAI API error: ${response.status}`);
+            throw new Error(`OpenAI API error: ${response.status} ${response.statusText}`);
         }
 
         const data = await response.json();
         return data.choices[0].message.content;
     } catch (error) {
         console.error('Error with OpenAI API:', error);
-        return "I'm having trouble processing your request right now. Please try again.";
+        throw error;
     }
 }
 
-// Process user message and determine action
-async function processUserMessage(userMessage, conversationHistory = []) {
-    const message = userMessage.toLowerCase().trim();
-    
-    // Check for performance queries
-    if (message.includes('does ') && (message.includes('play') || message.includes('perform')) ||
-        message.includes('is ') && (message.includes('playing') || message.includes('performing')) ||
-        message.includes('when is')) {
+// Process user message with enhanced query classification
+async function processUserMessage(userMessage, conversationState) {
+    try {
+        const systemPrompt = `You are a helpful ticket assistant for Fair Ticket Exchange. Your job is to help users find tickets and event information.
+
+QUERY CLASSIFICATION:
+1. PERFORMANCE QUERIES: "does X play", "is X performing", "when is X playing" → Use searchArtistPerformances()
+2. PRICE QUERIES: "what's the price", "how much", "cost of tickets" → Use getPriceFromVividSeats() 
+3. RECOMMENDATION QUERIES: "recommendations", "what's happening", "events this weekend" → Use getEventRecommendations()
+
+RESPONSE GUIDELINES:
+- For performance queries: Answer if/when they're performing, include date and venue
+- For price queries: Provide the price from our database or Vivid Seats
+- For recommendations: List events from our database with pagination
+- Always be conversational and helpful
+- If you can't find info in database, offer to do research with disclaimer about accuracy
+
+CONVERSATION FLOW:
+1. Greet users warmly
+2. Help with their query (performance/price/recommendations)
+3. If they want tickets, ask: artist/event, quantity, budget, date preference
+4. Collect: name, email, phone (optional), notes (optional)
+5. Confirm details before submitting
+
+Current conversation state: ${JSON.stringify(conversationState)}
+
+Determine the search_type based on the user's message:
+- "performance" for questions about if/when artists are performing
+- "price" for questions about ticket prices
+- "recommendations" for requests for event suggestions
+- "conversation" for general chat or ticket booking flow`;
+
+        const messages = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage }
+        ];
+
+        // Classify the query type
+        let searchType = 'conversation';
+        const lowerMessage = userMessage.toLowerCase();
         
-        // Extract artist name
-        const artistMatch = message.match(/(?:does|is|when is)\s+([^?]+?)(?:\s+(?:play|perform|playing|performing))/i);
-        if (artistMatch) {
-            const artist = artistMatch[1].trim();
-            const performances = await searchArtistPerformances(artist);
+        if (lowerMessage.includes('does') && (lowerMessage.includes('play') || lowerMessage.includes('perform')) ||
+            lowerMessage.includes('when is') || lowerMessage.includes('is performing')) {
+            searchType = 'performance';
+        } else if (lowerMessage.includes('price') || lowerMessage.includes('cost') || lowerMessage.includes('how much')) {
+            searchType = 'price';
+        } else if (lowerMessage.includes('recommend') || lowerMessage.includes('what\'s happening') || 
+                   lowerMessage.includes('events') || lowerMessage.includes('shows')) {
+            searchType = 'recommendations';
+        }
+
+        let searchResult = null;
+        
+        // Perform appropriate search based on query type
+        if (searchType === 'performance') {
+            // Extract artist name from query
+            const artistMatch = lowerMessage.match(/does (.+?) play|is (.+?) performing|when is (.+?) playing/);
+            if (artistMatch) {
+                const artist = artistMatch[1] || artistMatch[2] || artistMatch[3];
+                searchResult = await searchArtistPerformances(artist.trim());
+            }
+        } else if (searchType === 'price') {
+            // Extract artist/event name from query
+            const priceMatch = lowerMessage.match(/price (?:for|of) (.+)|how much (?:is|are|for) (.+)|cost of (.+)/);
+            if (priceMatch) {
+                const artist = priceMatch[1] || priceMatch[2] || priceMatch[3];
+                searchResult = await getPriceFromVividSeats(artist.trim());
+            }
+        } else if (searchType === 'recommendations') {
+            // Extract date filter if present
+            let dateFilter = null;
+            if (lowerMessage.includes('weekend')) dateFilter = 'weekend';
+            if (lowerMessage.includes('tonight')) dateFilter = 'tonight';
+            if (lowerMessage.includes('tomorrow')) dateFilter = 'tomorrow';
             
-            if (performances.length > 0) {
-                const performance = performances[0];
-                const date = new Date(performance.date).toLocaleDateString('en-US', {
-                    weekday: 'short',
-                    month: 'short',
-                    day: 'numeric'
-                });
-                return `Yes! ${performance.artist} is performing on ${date} at ${performance.venue}. Would you like ticket information?`;
-            } else {
-                // Use web search fallback
-                const webResult = await searchPerformanceWebFallback(artist);
-                if (webResult) {
-                    return webResult;
-                } else {
-                    return `I don't have that information in my database at the moment, but if you'd like I can do some research and let you know. This might not be 100% accurate but here's what I found through a web search.`;
-                }
+            const recommendations = await getEventRecommendations(dateFilter);
+            if (recommendations.events.length > 0) {
+                searchResult = recommendations.events[0]; // Get first recommendation
             }
         }
-    }
-    
-    // Check for price queries
-    if (message.includes('price') || message.includes('cost') || message.includes('how much')) {
-        // Extract artist/event name
-        const priceMatch = message.match(/(?:price|cost|how much).*?(?:for|of)\s+([^?]+)/i);
-        if (priceMatch) {
-            const artist = priceMatch[1].trim();
-            const priceResult = await getPriceFromDatabase(artist);
-            
-            if (priceResult && priceResult.price) {
-                return `I found tickets starting from ${priceResult.price} on Vivid Seats. How many tickets do you need?`;
-            } else if (priceResult && priceResult.event) {
-                // Found event but couldn't get price from Vivid Seats link
-                const webPrice = await getPriceWebFallback(artist);
-                if (webPrice) {
-                    return `I found the event but couldn't get the current price from Vivid Seats. Based on my research, tickets appear to start around ${webPrice}. This might not be 100% accurate but here's what I found.`;
-                } else {
-                    return `I found the event but don't have current pricing available. Let me do some research and get back to you with pricing information.`;
-                }
-            } else {
-                // No event found in database, try web search
-                const webPrice = await getPriceWebFallback(artist);
-                if (webPrice) {
-                    return `I don't have that information in my database at the moment, but based on my research, tickets appear to start around ${webPrice}. This might not be 100% accurate but here's what I found.`;
-                } else {
-                    return `I don't have that information in my database at the moment, but if you'd like I can do some research and let you know. This might not be 100% accurate but here's what I can find.`;
-                }
-            }
+
+        // Add search result to system prompt if available
+        if (searchResult) {
+            messages[0].content += `\n\nSEARCH RESULT: ${JSON.stringify(searchResult)}`;
         }
+
+        const response = await getChatCompletion(messages);
+        return response;
+    } catch (error) {
+        console.error('Error processing user message:', error);
+        return "I'm having trouble processing your request right now. Please try again in a moment.";
     }
-    
-    // Check for recommendation queries
-    if (message.includes('recommend') || message.includes('what') && message.includes('happening') ||
-        message.includes('events') || message.includes('shows') || message.includes('weekend') ||
-        message.includes('recomend') || message.includes('recomendations')) { // Handle typos
-        
-        let dateFilter = null;
-        if (message.includes('weekend')) dateFilter = 'weekend';
-        else if (message.includes('week')) dateFilter = 'week';
-        else if (message.includes('month')) dateFilter = 'month';
-        else if (message.includes('tonight') || message.includes('today')) dateFilter = 'tonight';
-        
-        const recommendationResult = await getEventRecommendations(dateFilter, 0, 3);
-        
-        if (recommendationResult.events.length > 0) {
-            let response = "Here are some great events coming up:\n\n";
-            
-            recommendationResult.events.forEach((event, index) => {
-                const date = new Date(event.date).toLocaleDateString('en-US', {
-                    weekday: 'short',
-                    month: 'short',
-                    day: 'numeric'
-                });
-                const price = event.currentPrice ? ` - Starting at ${event.currentPrice}` : '';
-                response += `${index + 1}. ${event.artist} - ${date} at ${event.venue}${price}\n`;
-            });
-            
-            if (recommendationResult.hasMore) {
-                response += `\nWould you like to see more events? I have ${recommendationResult.total - 3} more suggestions.`;
-            }
-            
-            return response;
-        } else {
-            // Use web search fallback
-            const webResult = await getRecommendationsWebFallback(dateFilter);
-            if (webResult) {
-                return webResult;
-            } else {
-                return `I don't have current event recommendations in my database, but if you'd like I can do some research and let you know what's happening. This might not be 100% accurate but here's what I can find.`;
-            }
-        }
-    }
-    
-    // Default to OpenAI for general conversation
-    const messages = [
-        ...conversationHistory,
-        { role: 'user', content: userMessage }
-    ];
-    
-    return await getChatCompletion(messages);
 }
 
 // Main Azure Function
 module.exports = async function (context, req) {
-    // Enable CORS
+    // Handle CORS
     context.res = {
         headers: {
             'Access-Control-Allow-Origin': '*',
@@ -629,14 +647,13 @@ module.exports = async function (context, req) {
         }
     };
 
-    // Handle preflight requests
     if (req.method === 'OPTIONS') {
         context.res.status = 200;
         return;
     }
 
     try {
-        const { message, conversationHistory } = req.body;
+        const { message, conversationState = {} } = req.body || {};
 
         if (!message) {
             context.res = {
@@ -647,29 +664,34 @@ module.exports = async function (context, req) {
             return;
         }
 
-        const response = await processUserMessage(message, conversationHistory || []);
+        const response = await processUserMessage(message, conversationState);
 
         context.res = {
             ...context.res,
             status: 200,
-            body: { response }
+            body: { 
+                response: response,
+                conversationState: conversationState
+            }
         };
 
     } catch (error) {
-        console.error("Error processing request:", error);
+        console.error('Function execution error:', error);
         context.res = {
             ...context.res,
             status: 500,
-            body: { error: `Internal server error: ${error.message || error}` }
+            body: { 
+                error: 'Something went wrong. Please try again.',
+                details: error.message 
+            }
         };
     }
 };
 
 // Export functions for testing
 module.exports.searchArtistPerformances = searchArtistPerformances;
-module.exports.getEventRecommendations = getEventRecommendations;
 module.exports.getPriceFromVividSeats = getPriceFromVividSeats;
-
+module.exports.getEventRecommendations = getEventRecommendations;
 
 
 
