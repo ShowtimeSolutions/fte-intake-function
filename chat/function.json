@@ -9,5 +9,5 @@
       "route": "chat"
     }
   ],
-  "scriptFile": "index.js" // <--- CHANGE THIS LINE
+  "scriptFile": "index.js" 
 }
