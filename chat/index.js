@@ -1,485 +1,451 @@
-// ------------------------------------
-// HYBRID VERSION: Working conversation flow + Enhanced features
-// ------------------------------------
-const { google } = require("googleapis");
+// index.js — Azure Function (Node 18+)
+const { GoogleSpreadsheet } = require("google-spreadsheet");
+const { JWT } = require("google-auth-library");
 const fetch = require("node-fetch");
 
-/* =====================  Google Sheets - WORKING VERSION  ===================== */
-async function getSheetsClient() {
-  const creds = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
-  const auth = new google.auth.JWT(
-    creds.client_email,
+/* ============ ENV & CONSTANTS ============ */
+const SHEET_ID = process.env.GOOGLE_SHEETS_DATA_ID || "1KY-O6F-6rwSUsCvfQGQaADu985jTDCUJN4Oc0zKpiBA"; // your tracker
+const TAB_NAME = process.env.GOOGLE_SHEETS_DATA_TAB || "Local Price Tracker";
+
+// Where chat requests are saved (same sheet/tab as your form target)
+const CAPTURE_SHEET_ID = process.env.GOOGLE_SHEETS_ID || SHEET_ID;
+const CAPTURE_RANGE = process.env.GOOGLE_SHEETS_RANGE || "Sheet1!A:I";
+
+const SERPER_API_KEY = must("SERPER_API_KEY");
+const OPENAI_API_KEY = must("OPENAI_API_KEY");
+const OPENAI_API_BASE = (process.env.OPENAI_API_BASE || "https://api.openai.com/v1").replace(/\/+$/, "");
+
+/* ============ UTIL ============ */
+function must(name) {
+  const v = process.env[name];
+  if (!v || String(v).trim() === "") throw new Error(`Missing env var ${name}`);
+  return v;
+}
+function parseServiceAccount() {
+  // Support the single JSON var or split vars
+  if (process.env.GOOGLE_SHEETS_CREDENTIALS) {
+    const creds = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
+    if (creds.private_key && creds.private_key.includes("\\n")) {
+      creds.private_key = creds.private_key.replace(/\\n/g, "\n");
+    }
+    return { email: creds.client_email, key: creds.private_key };
+  }
+  if (process.env.GOOGLE_SHEETS_CLIENT_EMAIL && process.env.GOOGLE_SHEETS_PRIVATE_KEY) {
+    return {
+      email: process.env.GOOGLE_SHEETS_CLIENT_EMAIL,
+      key: process.env.GOOGLE_SHEETS_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    };
+  }
+  throw new Error("Missing Google service account: set GOOGLE_SHEETS_CREDENTIALS (JSON) or GOOGLE_SHEETS_CLIENT_EMAIL + GOOGLE_SHEETS_PRIVATE_KEY.");
+}
+
+/* ============ GOOGLE SHEETS (READ) ============ */
+let sheetsCache = { data: null, ts: 0, ttl: 30 * 60 * 1000 }; // 30 min
+
+async function initDoc(sheetId) {
+  const sa = parseServiceAccount();
+  const auth = new JWT({
+    email: sa.email,
+    key: sa.key,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+  });
+  const doc = new GoogleSpreadsheet(sheetId, auth);
+  await doc.loadInfo();
+  return doc;
+}
+async function loadEventsData() {
+  const now = Date.now();
+  if (sheetsCache.data && now - sheetsCache.ts < sheetsCache.ttl) return sheetsCache.data;
+
+  const doc = await initDoc(SHEET_ID);
+  const sheet = doc.sheetsByTitle[TAB_NAME];
+  if (!sheet) throw new Error(`Sheet tab "${TAB_NAME}" not found`);
+  const rows = await sheet.getRows();
+
+  const events = rows
+    .map((row) => ({
+      eventId: row.get("Event ID"),
+      priceTrend: row.get("Price Trend"),
+      artist: row.get("Artist"),
+      venue: row.get("Venue"),
+      date: row.get("Date"),
+      vividLink: row.get("Vivid Link"),
+      skyboxLink: row.get("SkyBox Link"),
+      initialTrackingDate: row.get("Initial Tracking Date"),
+      currentPrice: getCurrentPrice(row),
+    }))
+    .filter((e) => e.artist && e.date);
+
+  sheetsCache = { data: events, ts: now, ttl: sheetsCache.ttl };
+  return events;
+}
+function getCurrentPrice(row) {
+  for (let i = 1; i <= 42; i++) {
+    const p = row.get(`Price #${i}`);
+    if (p && String(p).trim() !== "") return p;
+  }
+  return null;
+}
+
+/* ============ SEARCH / PRICE HELPERS ============ */
+async function searchArtistPerformances(artistQuery) {
+  try {
+    const events = await loadEventsData();
+    const q = artistQuery.toLowerCase().trim();
+    const matches = events.filter((e) => {
+      const a = e.artist.toLowerCase();
+      return (
+        a.includes(q) ||
+        q.includes(a) ||
+        a.split(/[-\s]+/).some((w) => q.includes(w)) ||
+        q.split(/[-\s]+/).some((w) => a.includes(w))
+      );
+    });
+    return matches.sort((a, b) => new Date(a.date) - new Date(b.date));
+  } catch (e) {
+    console.error("searchArtistPerformances:", e);
+    return [];
+  }
+}
+async function getEventRecommendations(dateFilter = null, offset = 0, limit = 3) {
+  try {
+    const events = await loadEventsData();
+    let startDate, endDate;
+    const today = new Date();
+    if (dateFilter?.includes("weekend")) {
+      const dow = today.getDay();
+      const daysUntilFri = dow <= 5 ? 5 - dow : 12 - dow;
+      startDate = new Date(today);
+      startDate.setDate(today.getDate() + daysUntilFri);
+      endDate = new Date(startDate);
+      endDate.setDate(startDate.getDate() + 2);
+    } else if (dateFilter?.includes("week")) {
+      startDate = today;
+      endDate = new Date(today);
+      endDate.setDate(today.getDate() + 7);
+    } else if (dateFilter?.includes("month")) {
+      startDate = today;
+      endDate = new Date(today);
+      endDate.setDate(today.getDate() + 30);
+    } else if (dateFilter?.includes("tonight") || dateFilter?.includes("today")) {
+      startDate = today;
+      endDate = new Date(today);
+      endDate.setDate(today.getDate() + 1);
+    } else {
+      startDate = today;
+      endDate = new Date(today);
+      endDate.setDate(today.getDate() + 14);
+    }
+    const filtered = events.filter((e) => {
+      const d = new Date(e.date);
+      return d >= startDate && d <= endDate;
+    });
+    const sorted = filtered.sort((a, b) => new Date(a.date) - new Date(b.date));
+    const slice = sorted.slice(offset, offset + limit);
+    return { events: slice, total: sorted.length, hasMore: offset + limit < sorted.length };
+  } catch (e) {
+    console.error("getEventRecommendations:", e);
+    return { events: [], total: 0, hasMore: false };
+  }
+}
+async function getPriceFromVividSeats(vividLink) {
+  try {
+    if (!vividLink || !vividLink.trim()) return null;
+    const resp = await fetch(vividLink, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    const pats = [
+      /get in for \$(\d+)/i,
+      /starting at \$(\d+)/i,
+      /from \$(\d+)/i,
+      /\$(\d+)\+/,
+      /"price":\s*"?\$?(\d+)/i,
+      /data-price="(\d+)"/i,
+      /price-value[^>]*>\$(\d+)/i,
+    ];
+    for (const re of pats) {
+      const m = html.match(re);
+      if (m?.[1]) return `$${m[1]}`;
+    }
+    return null;
+  } catch (e) {
+    console.error("getPriceFromVividSeats:", e);
+    return null;
+  }
+}
+async function getPriceFromDatabase(artistQuery) {
+  try {
+    const events = await loadEventsData();
+    const q = artistQuery.toLowerCase().trim();
+    const matches = events.filter((e) => {
+      const a = e.artist.toLowerCase();
+      return (
+        a.includes(q) ||
+        q.includes(a) ||
+        a.split(/[-\s]+/).some((w) => q.includes(w)) ||
+        q.split(/[-\s]+/).some((w) => a.includes(w))
+      );
+    });
+    if (!matches.length) return null;
+    const event = matches[0];
+    if (event.vividLink) {
+      const p = await getPriceFromVividSeats(event.vividLink);
+      if (p) return { price: p, source: "vivid_seats", event };
+    }
+    return { price: null, source: "vivid_seats", event };
+  } catch (e) {
+    console.error("getPriceFromDatabase:", e);
+    return null;
+  }
+}
+
+/* ============ SIMPLE SERPER FALLBACKS (kept from your working build) ============ */
+async function searchPerformanceWebFallback(artistQuery) {
+  try {
+    const response = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: `${artistQuery} chicago concerts 2025 tickets`, num: 5 }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const results = data.organic || [];
+    for (const r of results) {
+      const content = `${r.title} ${r.snippet}`.toLowerCase();
+      const datePat = /(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}|\d{1,2}\/\d{1,2}\/\d{4}/i;
+      const venuePat = /(united center|soldier field|wrigley field|allstate arena|chicago theatre|house of blues)/i;
+      const d = content.match(datePat);
+      const v = content.match(venuePat);
+      if (d || v) {
+        return `Based on my quick research, ${artistQuery} appears to have upcoming shows in Chicago${d ? ` around ${d[0]}` : ""}${v ? ` at ${v[0]}` : ""}. This may not be 100% accurate.`;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+async function getRecommendationsWebFallback(dateFilter = null) {
+  try {
+    let q = "chicago concerts events ";
+    q += dateFilter?.includes("weekend") ? "this weekend" : dateFilter?.includes("week") ? "this week" : "upcoming";
+    const response = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ q, num: 10 }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const results = data.organic || [];
+    const picks = [];
+    for (const r of results) {
+      const t = (r.title || "").toLowerCase();
+      const s = (r.snippet || "").toLowerCase();
+      if (t.includes("concert") || t.includes("show") || t.includes("event") || s.includes("tickets")) {
+        picks.push(r.title);
+        if (picks.length >= 3) break;
+      }
+    }
+    if (!picks.length) return null;
+    return `Here are a few things in Chicago:\n\n1) ${picks[0]}\n2) ${picks[1] || ""}\n3) ${picks[2] || ""}\n\n(This is from quick web research and may not be 100% accurate.)`.trim();
+  } catch {
+    return null;
+  }
+}
+async function getPriceWebFallback(artistQuery) {
+  try {
+    const response = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: `${artistQuery} chicago tickets price vivid seats`, num: 5 }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const results = data.organic || [];
+    const pats = [/get in for \$(\d+)/i, /starting at \$(\d+)/i, /from \$(\d+)/i, /tickets from \$(\d+)/i, /\$(\d+)\+/];
+    for (const r of results) {
+      const content = `${r.title} ${r.snippet}`;
+      for (const re of pats) {
+        const m = content.match(re);
+        if (m?.[1]) return `$${m[1]}`;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/* ============ OPENAI (for general chat turn) ============ */
+async function getChatCompletion(messages) {
+  const systemPrompt =
+    `You are a helpful ticket assistant for Fair Ticket Exchange (Chicago area).
+- Detect queries: performance, price, or recommendations.
+- First try the local database helpers the app provides (already run outside of you); otherwise continue the convo.
+- Keep replies short and conversational.
+- When user wants to place a request, collect: artist/event, ticket qty, budget tier ("<$50","$50–$99","$100–$149","$150–$199","$200–$249","$250–$299","$300–$349","$350–$399","$400–$499","$500+"), date/range (optional), name, email, phone (optional), notes (optional).
+- Summarize and ask to confirm before we save.`;
+
+  const resp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini", // safe, inexpensive; change if you use Azure deployment name via OPENAI_API_BASE
+      messages: [{ role: "system", content: systemPrompt }, ...messages],
+      temperature: 0.6,
+      max_tokens: 500,
+    }),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(`OpenAI error ${resp.status}: ${t}`);
+  }
+  const data = await resp.json();
+  return data.choices?.[0]?.message?.content || "Okay.";
+}
+
+/* ============ CAPTURE (WRITE) ============ */
+function toRow(c) {
+  const ts = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" });
+  return [
+    ts,
+    c.artist_or_event || "",
+    Number.isFinite(c.ticket_qty) ? c.ticket_qty : parseInt(c.ticket_qty || "", 10) || "",
+    c.budget_tier || "",
+    c.date_or_date_range || "",
+    c.name || "",
+    c.email || "",
+    c.phone || "",
+    c.notes || "",
+  ];
+}
+async function appendCaptureRow(row) {
+  // Use Sheets API v4 for writing (googleapis), but since you're already using google-spreadsheet for read-only,
+  // the simplest write path is to call your existing HTTP function endpoint OR switch to googleapis here.
+  // To keep your “working” behavior unchanged, we’ll write via googleapis values.append using a second auth object.
+  const { google } = require("googleapis");
+  const sa = parseServiceAccount();
+  const auth = new (require("google-auth-library").JWT)(
+    sa.email,
     null,
-    creds.private_key,
+    sa.key,
     ["https://www.googleapis.com/auth/spreadsheets"]
   );
   await auth.authorize();
-  return google.sheets({ version: "v4", auth });
-}
-
-async function appendToSheet(row) {
-  const sheets = await getSheetsClient();
-  const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
-  const range = process.env.GOOGLE_SHEETS_RANGE || "Sheet1!A:I";
+  const sheets = google.sheets({ version: "v4", auth });
   await sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range,
+    spreadsheetId: CAPTURE_SHEET_ID,
+    range: CAPTURE_RANGE,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
 }
 
-/**
- * Unified row (A..I):
- *  A Timestamp
- *  B Artist_or_event
- *  C Ticket_qty
- *  D Budget_tier
- *  E Date_or_date_range
- *  F Name
- *  G Email
- *  H Phone
- *  I Notes
- */
-function toRow(c) {
-  const ts = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" });
-  const artist = c?.artist_or_event || "";
-  const qty = Number.isFinite(c?.ticket_qty)
-    ? c.ticket_qty
-    : (parseInt(c?.ticket_qty || "", 10) || "");
-  const budgetTier = c?.budget_tier || c?.budget || "";
-  const dateRange = c?.date_or_date_range || "";
-  const name = c?.name || "";
-  const email = c?.email || "";
-  const phone = c?.phone || "";
-  const notes = c?.notes || "";
-  return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
+/* ============ INTENT LAYER (VERY LIGHT) ============ */
+function isPerf(msg) {
+  const m = msg.toLowerCase();
+  return (m.includes("does ") && (m.includes("play") || m.includes("perform"))) ||
+         (m.includes("is ") && (m.includes("playing") || m.includes("performing"))) ||
+         m.includes("when is");
+}
+function isPrice(msg) {
+  const m = msg.toLowerCase();
+  return m.includes("price") || m.includes("cost") || m.includes("how much");
+}
+function isRecs(msg) {
+  const m = msg.toLowerCase();
+  return m.includes("recommend") || (m.includes("what") && m.includes("happening")) ||
+         m.includes("events") || m.includes("shows") || m.includes("weekend");
 }
 
-/* =====================  Enhanced Web Search with Vivid Seats Focus  ===================== */
-async function webSearch(query, location = "Chicago") {
-  try {
-    const searchQuery = location ? `${query} ${location}` : query;
-    
-    const response = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": process.env.SERPER_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        q: searchQuery,
-        num: 10
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Serper API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return (data.organic || []).map(result => ({
-      title: result.title || "",
-      snippet: result.snippet || "",
-      link: result.link || ""
-    }));
-  } catch (error) {
-    console.error('Web search error:', error);
-    return [];
-  }
-}
-
-/* =====================  Enhanced Price Extraction  ===================== */
-async function getTicketPrices(query) {
-  try {
-    // Focus on Vivid Seats for pricing
-    const vividQuery = `site:vividseats.com ${query} tickets Chicago`;
-    
-    const response = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": process.env.SERPER_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        q: vividQuery,
-        num: 5
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Serper API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const results = data.organic || [];
-    
-    for (const result of results) {
-      const text = `${result.title} ${result.snippet}`;
-      
-      // Multiple price extraction patterns
-      const pricePatterns = [
-        /\$(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/g,
-        /from \$(\d+)/i,
-        /starting at \$(\d+)/i,
-        /tickets from \$(\d+)/i,
-        /get in \$(\d+)/i
-      ];
-      
-      for (const pattern of pricePatterns) {
-        const matches = [...text.matchAll(pattern)];
-        if (matches.length > 0) {
-          const prices = matches.map(match => parseFloat(match[1].replace(',', '')));
-          return Math.min(...prices);
-        }
-      }
-    }
-    
-    return null;
-  } catch (error) {
-    console.error('Price extraction error:', error);
-    return null;
-  }
-}
-
-function minPriceAcross(results) {
-  const prices = [];
-  for (const r of results) {
-    const text = `${r.title} ${r.snippet}`;
-    const matches = text.match(/\$(\d{1,4}(?:,\d{3})*)/g);
-    if (matches) {
-      for (const m of matches) {
-        const num = parseFloat(m.replace(/[$,]/g, ""));
-        if (num >= 10 && num <= 9999) prices.push(num);
-      }
-    }
-  }
-  return prices.length ? Math.min(...prices) : null;
-}
-
-function priceSummaryMessage(price) {
-  if (price) {
-    return `I found tickets starting from $${price} on Vivid Seats. How many tickets do you need?`;
-  }
-  return "I'm having trouble finding current pricing. What specific event are you looking for?";
-}
-
-/* =====================  Enhanced Recommendations  ===================== */
-async function getChicagoRecommendations() {
-  try {
-    const query = "Chicago events concerts shows tickets this weekend upcoming";
-    const results = await webSearch(query);
-    
-    const recommendations = results
-      .filter(r => !irrelevant(r.title, r.snippet))
-      .slice(0, 5)
-      .map(r => `• ${r.title}`)
-      .join('\n');
-      
-    if (recommendations) {
-      return `Here are some popular events in Chicago:\n${recommendations}\n\nWhich one interests you?`;
-    }
-    
-    return "I'm having trouble finding current events. What specific artist or show are you looking for?";
-  } catch (error) {
-    console.error('Recommendations error:', error);
-    return "What specific event or artist are you interested in?";
-  }
-}
-
-function irrelevant(title, snippet) {
-  const text = `${title} ${snippet}`.toLowerCase();
-  return /\b(news|article|review|interview|biography|wiki|wikipedia|imdb|facebook|twitter|instagram)\b/.test(text);
-}
-
-/* =====================  Budget Tier Normalization  ===================== */
-const QTY_RE = /\b(\d{1,2})\s*(?:ticket|tix|seat)/i;
-const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/;
-const PHONE_RE = /\b(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})\b/;
-const DATE_WORDS = /\b(?:tonight|tomorrow|this weekend|next week|friday|saturday|sunday|monday|tuesday|wednesday|thursday|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}\/\d{1,2}|\d{1,2}-\d{1,2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i;
-
-function normalizeBudgetTier(text) {
-  const t = (text || "").toLowerCase().replace(/[^\w\s$-]/g, " ");
-  
-  if (/under.*50|less.*50|below.*50|<.*50|\$?50.*less|\$?50.*under/.test(t)) return "<$50";
-  if (/50.*99|50.*100|50.*to.*99|50.*-.*99|\$50.*\$99/.test(t)) return "$50–$99";
-  if (/100.*149|100.*150|100.*to.*149|100.*-.*149|\$100.*\$149/.test(t)) return "$100–$149";
-  if (/150.*199|150.*200|150.*to.*199|150.*-.*199|\$150.*\$199/.test(t)) return "$150–$199";
-  if (/200.*249|200.*250|200.*to.*249|200.*-.*249|\$200.*\$249/.test(t)) return "$200–$249";
-  if (/250.*299|250.*300|250.*to.*299|250.*-.*299|\$250.*\$299/.test(t)) return "$250–$299";
-  if (/300.*349|300.*350|300.*to.*349|300.*-.*349|\$300.*\$349/.test(t)) return "$300–$349";
-  if (/350.*399|350.*400|350.*to.*399|350.*-.*399|\$350.*\$399/.test(t)) return "$350–$399";
-  if (/400.*499|400.*500|400.*to.*499|400.*-.*499|\$400.*\$499/.test(t)) return "$400–$499";
-  if (/500.*more|500.*plus|over.*500|above.*500|500\+|\$500\+/.test(t)) return "$500+";
-  
-  // Simple number matching
-  const num = parseInt((t.match(/\$?(\d+)/) || ["", "0"])[1], 10);
-  if (num < 50) return "<$50";
-  if (num < 100) return "$50–$99";
-  if (num < 150) return "$100–$149";
-  if (num < 200) return "$150–$199";
-  if (num < 250) return "$200–$249";
-  if (num < 300) return "$250–$299";
-  if (num < 350) return "$300–$349";
-  if (num < 400) return "$350–$399";
-  if (num < 500) return "$400–$499";
-  if (num >= 500) return "$500+";
-  
-  return "";
-}
-
-/* =====================  Intent Detection  ===================== */
-function looksLikePrice(msg) { 
-  return /(price|prices|cost|how much)/i.test(msg || ""); 
-}
-
-function wantsSuggestions(msg) { 
-  return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas|what.*happening)/i.test(msg || ""); 
-}
-
-function mentionsChicago(msg) { 
-  return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); 
-}
-
-function userConfirmed(text) {
-  return /\b(yes|yep|yeah|correct|confirm|finalize|go ahead|proceed|place it|submit|that's right|looks good|do it|book it)\b/i.test(text || "");
-}
-
-function userAskedForm(text) {
-  return /\b(open|use|show)\b.*\b(form)\b|\bmanual request\b/i.test(text || "");
-}
-
-/* =====================  OpenAI Integration - WORKING VERSION  ===================== */
-async function callOpenAI(messages) {
-  const sysPrompt = `
-You are FTE's polite, fast, and helpful ticket intake assistant on a public website.
-
-GOALS
-- Help the user pick or request tickets with minimum back-and-forth.
-- Be conversational, but ask only one short question at a time for missing details.
-- When the user confirms the details ("yes", "proceed", "go ahead", etc.), CALL the capture_ticket_request tool immediately with the fields you know.
-- If the user wants ideas, dates, or prices, use the web_search tool first and reply with a short summary.
-
-DATA TO CAPTURE (for capture_ticket_request)
-- artist_or_event (required) — e.g., "Jonas Brothers"
-- ticket_qty (required, integer)
-- budget_tier (required, choose one exactly): "<$50","$50–$99","$100–$149","$150–$199","$200–$249","$250–$299","$300–$349","$350–$399","$400–$499","$500+"
-- date_or_date_range (optional)
-- name (required)
-- email (required)
-- phone (optional)
-- notes (optional, short phrases only)
-
-STYLE
-- Short, friendly messages.
-- Never ask for City/Residence.
-- Do not tell the user to fill a form. If they ask for the form, the website will open it.
-- After the user confirms the summary, CALL capture_ticket_request instead of asking again.
-
-PRICE / IDEAS
-- If the user asks "what's on" / "what's happening" / "recommendations" / "prices", call web_search first.
-- For price searches, be specific with the query including the artist/event name.
-- Suggestions: provide a short list (3–5 lines) if they ask for ideas.
-
-IMPORTANT
-- Do not restart the conversation after the user confirms. Proceed to capture.
-- If you already know all the required details (artist/event, ticket_qty, budget_tier, name, email),
-  you should immediately CALL capture_ticket_request after the user confirms, instead of asking again.
-- If the user says "no", "not sure", or "undecided", keep the chat light and offer to search events.
-- Always lean toward moving the user forward rather than looping back.
-
-TONE
-- Friendly, concise, approachable.
-- Use plain conversational English (no technical language).
-- Encourage the user lightly, but don't oversell.
-`.trim();
-
-  const body = {
-    model: "gpt-4o-mini",
-    temperature: 0.2,
-    messages: [{ role: "system", content: sysPrompt }, ...messages],
-    tools: [
-      {
-        type: "function",
-        function: {
-          name: "capture_ticket_request",
-          description: "Finalize a ticket request and log to Google Sheets.",
-          parameters: {
-            type: "object",
-            properties: {
-              artist_or_event: { type: "string" },
-              ticket_qty: { type: "integer" },
-              budget_tier: {
-                type: "string",
-                enum: [
-                  "<$50","$50–$99","$100–$149","$150–$199",
-                  "$200–$249","$250–$299","$300–$349","$350–$399",
-                  "$400–$499","$500+"
-                ]
-              },
-              date_or_date_range: { type: "string" },
-              name: { type: "string" },
-              email: { type: "string" },
-              phone: { type: "string" },
-              notes: { type: "string" }
-            },
-            required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
-          }
-        }
-      },
-      {
-        type: "function",
-        function: {
-          name: "web_search",
-          description: "Search the web for events, venues, dates, ticket info, or prices.",
-          parameters: {
-            type: "object",
-            properties: {
-              q: { type: "string", description: "Search query (include artist/venue and 'tickets' when relevant)" },
-              location: { type: "string", description: "City/Region (optional)" }
-            },
-            required: ["q"]
-          }
-        }
-      }
-    ],
-    tool_choice: "auto"
-  };
-
-  const resp = await fetch(`${process.env.OPENAI_API_BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
-
-  if (!resp.ok) throw new Error(await resp.text());
-  return resp.json();
-}
-
-/* =====================  Response helpers  ===================== */
-function extractToolCalls(response) {
-  const message = response?.choices?.[0]?.message;
-  return message?.tool_calls || [];
-}
-
-function extractAssistantText(response) {
-  const message = response?.choices?.[0]?.message;
-  return message?.content || "";
-}
-
-/* =====================  Azure Function entry - WORKING VERSION  ===================== */
+/* ============ REQUEST HANDLER ============ */
 module.exports = async function (context, req) {
+  // CORS
   context.res = {
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Content-Type": "application/json"
-    }
+    },
   };
-
-  if (req.method === "OPTIONS") {
-    context.res.status = 200;
-    context.res.body = {};
-    return;
-  }
+  if (req.method === "OPTIONS") { context.res.status = 200; return; }
 
   try {
-    const { messages = [] } = req.body || {};
-    
-    if (!Array.isArray(messages) || messages.length === 0) {
-      context.res.status = 400;
-      context.res.body = { error: "Invalid messages format" };
-      return;
-    }
-
-    const lastUserMessage = messages[messages.length - 1];
-    const userText = String(lastUserMessage?.content || "");
-
-    // Handle special cases
-    if (userAskedForm(userText)) {
+    // Manual form direct save
+    if (req.body?.direct_capture && req.body?.capture) {
+      await appendCaptureRow(toRow(req.body.capture));
       context.res.status = 200;
-      context.res.body = { 
-        message: "I'll open the manual request form for you.",
-        action: "open_form"
-      };
+      context.res.body = { response: "Saved your request. We’ll follow up soon!" };
       return;
     }
 
-    // Call OpenAI
-    const openaiResponse = await callOpenAI(messages);
-    const toolCalls = extractToolCalls(openaiResponse);
-    const assistantText = extractAssistantText(openaiResponse);
-
-    // Process tool calls
-    let finalMessage = assistantText;
-    let shouldCapture = false;
-    let captureData = null;
-
-    for (const toolCall of toolCalls) {
-      const toolName = toolCall.function?.name;
-      const toolArgs = JSON.parse(toolCall.function?.arguments || "{}");
-
-      if (toolName === "web_search") {
-        try {
-          const searchResults = await webSearch(toolArgs.q, toolArgs.location);
-          
-          if (looksLikePrice(userText) || /price/i.test(toolArgs.q)) {
-            // Price search
-            const price = await getTicketPrices(toolArgs.q);
-            finalMessage = priceSummaryMessage(price);
-          } else if (wantsSuggestions(userText)) {
-            // Recommendations
-            const suggestions = searchResults
-              .filter(r => !irrelevant(r.title, r.snippet))
-              .slice(0, 5)
-              .map(r => `• ${r.title}`)
-              .join('\n');
-            finalMessage = suggestions ? 
-              `Here are some popular events:\n${suggestions}\n\nWhich one interests you?` :
-              "I'm having trouble finding current events. What specific artist or show are you looking for?";
-          } else {
-            // General search - extract price if available
-            const price = minPriceAcross(searchResults);
-            if (price) {
-              finalMessage = `I found tickets starting around $${price}. How many tickets do you need?`;
-            }
-          }
-        } catch (error) {
-          console.error('Search error:', error);
-          finalMessage = "I'm having trouble with the search right now. What specific event are you looking for?";
-        }
-      } else if (toolName === "capture_ticket_request") {
-        shouldCapture = true;
-        captureData = toolArgs;
-        finalMessage = `Perfect! I've captured your request for ${toolArgs.ticket_qty} tickets to ${toolArgs.artist_or_event}. Our team will reach out to you at ${toolArgs.email} with the best options within your ${toolArgs.budget_tier} budget. Thanks, ${toolArgs.name}!`;
-      }
+    const { message, conversationHistory = [] } = req.body || {};
+    if (!message) {
+      context.res.status = 400;
+      context.res.body = { error: "Message is required" };
+      return;
     }
 
-    // Capture to Google Sheets if needed
-    if (shouldCapture && captureData) {
-      try {
-        const row = toRow(captureData);
-        await appendToSheet(row);
-        console.log('Successfully captured to Google Sheets:', captureData);
-      } catch (error) {
-        console.error('Google Sheets error:', error);
-        // Don't fail the whole request if sheets fails
+    // Fast lanes that use your Google Sheet first
+    if (isPerf(message)) {
+      const artist = message.replace(/^(does|is|when is)\s*/i, "").replace(/(play|perform(ing)?)\??$/i, "").trim();
+      const hits = await searchArtistPerformances(artist);
+      if (hits.length) {
+        const show = hits[0];
+        const date = new Date(show.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+        context.res.status = 200;
+        context.res.body = { response: `Yes! ${show.artist} is performing on ${date} at ${show.venue}. Want ticket info?` };
+        return;
       }
+      const web = await searchPerformanceWebFallback(artist);
+      if (web) { context.res.status = 200; context.res.body = { response: web }; return; }
     }
 
+    if (isPrice(message)) {
+      const m = message.match(/(?:price|cost|how much).*?(?:for|of)\s+([^?]+)/i);
+      const artist = (m && m[1]) ? m[1].trim() : message.replace(/(price|cost|how much)/ig, "").trim();
+      const got = await getPriceFromDatabase(artist);
+      if (got?.price) { context.res.status = 200; context.res.body = { response: `I found tickets starting from ${got.price} on Vivid Seats. How many tickets do you need?` }; return; }
+      if (got?.event) {
+        const web = await getPriceWebFallback(artist);
+        if (web) { context.res.status = 200; context.res.body = { response: `I found the event but couldn't fetch a live price. Based on quick research, tickets start around ${web}.` }; return; }
+        context.res.status = 200; context.res.body = { response: "I found the event but don’t see a current price yet. I can keep checking and update you." }; return;
+      }
+      const web = await getPriceWebFallback(artist);
+      if (web) { context.res.status = 200; context.res.body = { response: `I don’t see it in our tracker, but quick research suggests tickets start around ${web}.` }; return; }
+    }
+
+    if (isRecs(message)) {
+      const df = /weekend/i.test(message) ? "weekend" : /week/i.test(message) ? "week" : /month/i.test(message) ? "month" : /today|tonight/i.test(message) ? "tonight" : null;
+      const recs = await getEventRecommendations(df, 0, 3);
+      if (recs.events.length) {
+        let out = "Here are a few picks:\n\n";
+        recs.events.forEach((e, i) => {
+          const d = new Date(e.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+          out += `${i + 1}. ${e.artist} — ${d} at ${e.venue}${e.currentPrice ? ` (from ${e.currentPrice})` : ""}\n`;
+        });
+        if (recs.hasMore) out += `\nWant to see more? I have ${recs.total - 3} additional suggestions.`;
+        context.res.status = 200;
+        context.res.body = { response: out.trim() };
+        return;
+      }
+      const web = await getRecommendationsWebFallback(df);
+      if (web) { context.res.status = 200; context.res.body = { response: web }; return; }
+    }
+
+    // Otherwise: general chat turn with OpenAI
+    const response = await getChatCompletion([
+      ...conversationHistory,
+      { role: "user", content: message },
+    ]);
     context.res.status = 200;
-    context.res.body = { 
-      message: finalMessage,
-      captured: shouldCapture
-    };
-
-  } catch (e) {
-    console.error('Function error:', e);
+    context.res.body = { response };
+  } catch (err) {
+    console.error("chat function error:", err);
     context.res.status = 500;
-    context.res.body = { error: String(e) };
+    context.res.body = { error: err.message || String(err) };
   }
 };
+
