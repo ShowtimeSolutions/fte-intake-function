@@ -728,6 +728,7 @@ RECOMMENDATIONS
 IMPORTANT
 - Don’t restart once the user confirms — proceed to capture.
 - Keep the tone conversational and concise.
+- Never use Markdown or formatting like **asterisks**. Show confirmations in plain text only.
 `;
 
   const body = {
