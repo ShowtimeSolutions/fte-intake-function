@@ -1,9 +1,9 @@
-// index.js — Azure Function (Node 18+) — streamlined (no live price search)
-
+// index.js — Azure Function (Node 18+)
+// ------------------------------------
 const { google } = require("googleapis");
-const fetch = require("node-fetch"); // still fine to keep
+const fetch = require("node-fetch");
 
-/* =============== Google Sheets =============== */
+/* =====================  Google Sheets  ===================== */
 async function getSheetsClient() {
   const creds = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
   const auth = new google.auth.JWT(
@@ -55,10 +55,11 @@ function toRow(c) {
   return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
 }
 
-/* =============== Budget normalization (no options shown to user) =============== */
+/* =====================  Budget tiering  ===================== */
 function normalizeBudgetTier(text = "") {
   const t = text.toLowerCase();
   const num = parseInt(t.replace(/[^\d]/g, ""), 10);
+
   if (/(<\s*\$?50|under\s*50|less\s*than\s*\$?50)/i.test(text)) return "<$50";
   if (/\b(50[\s–-]?99|50-99|50 to 99)\b/i.test(text)) return "$50–$99";
   if (/\b(100[\s–-]?149|100-149|100 to 149)\b/i.test(text)) return "$100–$149";
@@ -69,6 +70,7 @@ function normalizeBudgetTier(text = "") {
   if (/\b(350[\s–-]?399|350-399|350 to 399)\b/i.test(text)) return "$350–$399";
   if (/(400|450)/i.test(text)) return "$400–$499";
   if (/\$?500\+|over\s*\$?500|>\s*\$?500/i.test(text)) return "$500+";
+
   if (!isNaN(num)) {
     if (num < 50) return "<$50";
     if (num < 100) return "$50–$99";
@@ -87,7 +89,7 @@ function normalizeBudgetTier(text = "") {
 const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
 const PHONE_RE = /\b(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/;
 const QTY_RE   = /\b(\d{1,2})\b/;
-const DATE_WORDS = /\b(today|tonight|tomorrow|this\s*(week|weekend)|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{1,2}(?:,\s*\d{4})?)\b/i;
+const DATE_WORDS = /\b(today|tonight|tomorrow|this\s*(week|weekend)|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{1,2}(?:,\s*\d{4})?)\b/i;
 
 /** Turn-aware extraction */
 function extractTurnAware(messages) {
@@ -160,19 +162,6 @@ function extractFromTranscript(messages) {
   return { artist_or_event: artist || "", ticket_qty: qty ?? "", budget_tier, date_or_date_range, name, email, phone, notes };
 }
 
-function mergeCapture(a, b) {
-  return {
-    artist_or_event: a.artist_or_event || b.artist_or_event || "",
-    ticket_qty: a.ticket_qty || b.ticket_qty || "",
-    budget_tier: a.budget_tier || b.budget_tier || "",
-    date_or_date_range: a.date_or_date_range || b.date_or_date_range || "",
-    name: a.name || b.name || "",
-    email: a.email || b.email || "",
-    phone: a.phone || b.phone || "",
-    notes: a.notes || b.notes || ""
-  };
-}
-
 function haveRequired(c) {
   return !!(c.artist_or_event && c.ticket_qty && c.budget_tier && c.name && c.email);
 }
@@ -183,76 +172,76 @@ function userAskedForm(text) {
   return /\b(open|use|show)\b.*\b(form)\b|\bmanual request\b/i.test(text || "");
 }
 
-/* =============== Simple “hard-coded” recommendations =============== */
-const RECO_LIST = [
-  { artist: "Jonas Brothers", venue: "United Center", date: "2025-08-26" },
-  { artist: "Taylor Swift",   venue: "Soldier Field", date: "2025-09-02" },
-  { artist: "Bad Bunny",      venue: "Allstate Arena", date: "2025-08-31" },
-  { artist: "Blink-182",      venue: "United Center", date: "2025-09-05" },
-  { artist: "Metallica",      venue: "Soldier Field", date: "2025-09-12" },
-  { artist: "Bruce Springsteen", venue: "Wrigley Field", date: "2025-09-18" },
+/* =====================  Hard-coded recommendations  ===================== */
+/** Edit/extend this list whenever you like. Use ISO dates. */
+const RECOMMENDED_SHOWS = [
+  { artist: "Jonas Brothers", venue: "United Center", date: "2025-08-18" },
+  { artist: "Taylor Swift",   venue: "Soldier Field",  date: "2025-09-12" },
+  { artist: "Ed Sheeran",     venue: "Wrigley Field",  date: "2025-09-05" },
+  { artist: "Billie Eilish",  venue: "United Center",  date: "2025-08-29" },
+  { artist: "The Weeknd",     venue: "United Center",  date: "2025-10-03" },
 ];
 
-function parseMaybeDate(text) {
-  const d = new Date(text);
-  return isNaN(d.getTime()) ? null : d;
+function parseDateFromText(text) {
+  const m = String(text || "").match(DATE_WORDS);
+  if (!m) return null;
+  // very light parser: keep original token, we only need a filter string
+  return m[0];
 }
-function fmt(dStr) {
-  return new Date(dStr).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+function formatHuman(d) {
+  // input ISO 'YYYY-MM-DD' -> 'Aug 18'
+  const dt = new Date(d + "T12:00:00");
+  return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
-function pickRecommendations(userText) {
-  const today = new Date(); today.setHours(0,0,0,0);
-  const asked = parseMaybeDate(userText);
-  const pool = RECO_LIST
-    .filter(x => {
-      const dx = new Date(x.date);
-      dx.setHours(0,0,0,0);
-      if (asked) return dx.getTime() === asked.setHours(0,0,0,0);
-      return dx >= today;
-    })
-    .sort((a,b) => new Date(a.date) - new Date(b.date))
-    .slice(0,3);
+function upcomingRecommendations(requestedToken) {
+  const todayISO = new Date().toISOString().slice(0,10);
+  let pool = RECOMMENDED_SHOWS.filter(s => s.date >= todayISO);
 
-  if (pool.length === 0) return "I don’t have any picks for that date yet. Want to try another date or artist?";
-  const lines = pool.map(x => `• ${x.artist} @ ${x.venue} on ${fmt(x.date)}`).join("\n");
-  return `Here are a few picks:\n${lines}\n\nInterested in one of these?`;
+  // if user mentioned a specific month/day token, lightly filter by month/day text
+  if (requestedToken) {
+    const t = requestedToken.toLowerCase();
+    pool = pool.filter(s => {
+      const pretty = formatHuman(s.date).toLowerCase(); // 'aug 18'
+      return pretty.includes(t.replace(",", ""));
+    });
+    if (pool.length === 0) pool = RECOMMENDED_SHOWS.filter(s => s.date >= todayISO);
+  }
+
+  return pool
+    .sort((a,b) => a.date.localeCompare(b.date))
+    .slice(0, 3)
+    .map((s, i) => `${i+1}. ${s.artist} @ ${s.venue} on ${formatHuman(s.date)}`);
 }
 
-/* =============== OpenAI (tool only for capture) =============== */
+/* =====================  OpenAI  ===================== */
 async function callOpenAI(messages) {
   const sysPrompt = `
-You are FTE’s polite, fast, and helpful ticket intake assistant on a public website.
+You are FTE’s polite, fast, helpful ticket-intake assistant on a public website.
 
 GOALS
-- Help the user request tickets with minimum back-and-forth.
-- Be conversational—ask only one short question at a time for missing details.
-- When the user confirms ("yes", "proceed", "go ahead", etc.), CALL the capture_ticket_request tool with the fields you know.
+- Help the user request tickets with minimal back-and-forth.
+- Ask only one short question at a time for missing info.
+- When the user confirms details, CALL the capture_ticket_request tool immediately.
 
 DATA TO CAPTURE
 - artist_or_event (required)
-- ticket_qty (required, integer)
-- budget_tier (required; DEDUCE the tier from the user's free text; do NOT list choices)
+- ticket_qty (required integer)
+- budget_tier (required; DEDUCE from whatever budget text they give — do not list choices)
 - date_or_date_range (optional)
 - name (required)
 - email (required)
 - phone (optional)
-- notes (optional; short phrases only)
-
-STYLE
-- Short, friendly messages.
-- Never ask for City/Residence.
-- Do not tell the user to fill a form; if they ask, the website will open it.
-- After the user confirms the summary, CALL capture_ticket_request — do not ask again.
+- notes (optional; very short)
 
 PRICES
-- Do NOT fetch live prices. If asked: "I can’t pull exact prices right now, but that feature is coming soon—our team will follow up with current pricing and tips to get the best deal."
+- If the user asks for prices say: “I can’t pull exact prices right now, but that feature is coming soon — our team will follow up with current pricing and how to get the best deal.”
 
 RECOMMENDATIONS
-- If they ask for ideas, let the server provide suggestions. Keep your reply short and continue the intake only if they pick one.
+- The server will send any recommendation lists. Don’t search for events yourself.
 
 IMPORTANT
-- Don’t restart after confirmation—proceed to capture.
-- If you already have all required details (artist_or_event, ticket_qty, budget_tier, name, email) after the user confirms, CALL capture_ticket_request.
+- Don’t restart once the user confirms — proceed to capture.
+- Keep the tone conversational and concise.
 `;
 
   const body = {
@@ -305,20 +294,18 @@ IMPORTANT
   return resp.json();
 }
 
-function extractToolCalls(response) {
-  const message = response?.choices?.[0]?.message;
-  return message?.tool_calls || [];
+function getToolCalls(openaiResp) {
+  return openaiResp?.choices?.[0]?.message?.tool_calls || [];
 }
-function extractAssistantText(response) {
-  const message = response?.choices?.[0]?.message;
-  return message?.content || "";
+function getAssistantText(openaiResp) {
+  return openaiResp?.choices?.[0]?.message?.content || "";
 }
 
-/* =============== Intent helpers =============== */
+/* =====================  Intent helpers  ===================== */
 function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
-function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas|what.*happening|what.*shows)/i.test(msg || ""); }
+function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test((msg||"").toLowerCase()); }
 
-/* =============== Azure Function entry =============== */
+/* =====================  Azure Function entry  ===================== */
 module.exports = async function (context, req) {
   context.res = {
     headers: {
@@ -329,13 +316,9 @@ module.exports = async function (context, req) {
     }
   };
 
-  if (req.method === "OPTIONS") {
-    context.res.status = 200;
-    context.res.body = {};
-    return;
-  }
+  if (req.method === "OPTIONS") { context.res.status = 200; context.res.body = {}; return; }
 
-  // Direct capture from the inline form
+  // Manual modal capture from Framer
   if (req.body?.direct_capture && req.body?.capture) {
     try {
       await appendToSheet(toRow(req.body.capture));
@@ -359,67 +342,72 @@ module.exports = async function (context, req) {
     const lastUserMessage = messages[messages.length - 1];
     const userText = String(lastUserMessage?.content || "");
 
-    // Manual form
+    // Open the manual form on request
     if (userAskedForm(userText)) {
       context.res.status = 200;
-      context.res.body = {
-        message: "I'll open the manual request form for you.",
-        action: "open_form"
-      };
+      context.res.body = { message: "Opening the manual request form…", openForm: true };
       return;
     }
 
-    // Prices: canned message
+    // --- NEW: hard-coded recommendations with the exact format requested
+    if (wantsSuggestions(userText)) {
+      const token = parseDateFromText(userText); // optional date token in their message
+      const list = upcomingRecommendations(token);
+      const msg = list.length
+        ? `Great! Here are a few options:\n\n${list.join("\n")}\n\nDo any of these interest you?`
+        : "I don’t have anything upcoming for that date window. Tell me an artist you like and I’ll help you request tickets.";
+
+      context.res.status = 200;
+      context.res.body = { message: msg };
+      return;
+    }
+
+    // If the user asks about price, show the placeholder message (no scraping)
     if (looksLikePrice(userText)) {
       context.res.status = 200;
       context.res.body = {
-        message: "I can’t pull exact prices right now, but that feature is coming soon—our team will follow up with current pricing and tips to get the best deal."
+        message:
+          "I can’t pull exact prices right now, but that feature is coming soon — our team will follow up with current pricing and tips to get the best deal. Want me to place a request for you?"
       };
       return;
     }
 
-    // Recommendations: return 3 from hard-coded list
-    if (wantsSuggestions(userText)) {
-      context.res.status = 200;
-      context.res.body = { message: pickRecommendations(userText) };
-      return;
-    }
-
-    // Otherwise, run the normal intake (LLM + capture tool)
+    // ----- Let the model run the chat flow (and call capture tool when ready)
     const openaiResponse = await callOpenAI(messages);
-    const toolCalls = extractToolCalls(openaiResponse);
-    let finalMessage = extractAssistantText(openaiResponse);
-    let shouldCapture = false;
+    const toolCalls = getToolCalls(openaiResponse);
+    let finalMessage = getAssistantText(openaiResponse);
     let captureData = null;
 
-    for (const tc of toolCalls) {
-      const toolName = tc.function?.name;
-      const toolArgs = JSON.parse(tc.function?.arguments || "{}");
-      if (toolName === "capture_ticket_request") {
-        shouldCapture = true;
-        captureData = toolArgs;
-        finalMessage =
-          `Perfect! I've captured your request for ${toolArgs.ticket_qty} tickets to ${toolArgs.artist_or_event}. ` +
-          `Our team will reach out to you at ${toolArgs.email} with the best options within your ${toolArgs.budget_tier} budget. ` +
-          `Thanks, ${toolArgs.name}!`;
+    for (const call of toolCalls) {
+      const name = call.function?.name;
+      const args = JSON.parse(call.function?.arguments || "{}");
+      if (name === "capture_ticket_request") {
+        captureData = args;
       }
     }
 
-    if (shouldCapture && captureData) {
+    if (captureData) {
       try {
-        await appendToSheet(toRow(captureData));
+        // Ensure budget tier is normalized if the model guessed loosely
+        captureData.budget_tier = normalizeBudgetTier(captureData.budget_tier || "");
+        const row = toRow(captureData);
+        await appendToSheet(row);
+        finalMessage =
+          `Perfect! I’ve captured your request for ${captureData.ticket_qty} ` +
+          `tickets to ${captureData.artist_or_event}. We’ll reach out to ${captureData.email} ` +
+          `with options that fit your ${captureData.budget_tier} budget. Thanks, ${captureData.name}!`;
       } catch (e) {
-        // don't fail chat if Sheets write hiccups
-        console.error("Sheets append error:", e);
+        context.log.error("Sheet append failed:", e);
       }
     }
 
     context.res.status = 200;
-    context.res.body = { message: finalMessage, captured: shouldCapture };
+    context.res.body = { message: finalMessage || "Got it!" };
 
   } catch (e) {
-    console.error("Function error:", e);
+    context.log.error(e);
     context.res.status = 500;
     context.res.body = { error: String(e) };
   }
 };
+
