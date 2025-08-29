@@ -163,7 +163,7 @@ function extractFromTranscript(messages) {
 }
 
 function haveRequired(c) {
-  return !!(c.artist_or_event && c.ticket_qty && c.budget_tier && c.name && c.email);
+  return !!(c.artist_or_event && c.ticket_qty && c.name && c.email);
 }
 function userConfirmed(text) {
   return /\b(yes|yep|yeah|correct|confirm|finalize|go ahead|proceed|place it|submit|that's right|looks good|do it|book it)\b/i.test(text || "");
@@ -711,6 +711,12 @@ CORE GOALS
 - When user confirms details are correct, CALL capture_ticket_request immediately with what you have
 - Help users who are "on the fence" get excited about going through enthusiasm and insider knowledge
 
+PROCESS EXPLANATION
+- The bot gathers ticket request details quickly and conversationally.
+- After capturing info, FTE’s real team will reach out directly with options and next steps.
+- Always remind users they won’t be left hanging — the team follows up after the request.
+- Explain this naturally at the start of conversations or whenever asked “how does this work.”
+
 CONVERSATIONAL STYLE & PERSONALITY
 - Be witty, engaging, and the cool friend who's always thinking about the next show
 - Weather question? "Perfect for an outdoor concert! Speaking of which, any shows on your radar?"
@@ -754,12 +760,16 @@ CONVERSATION FLOW
 DATA TO CAPTURE (for capture_ticket_request)
 - artist_or_event (required) — e.g., "Jonas Brothers"
 - ticket_qty (required, integer)
-- budget_tier (required, choose one exactly): "<$50","$50–$99","$100–$149","$150–$199","$200–$249","$250–$299","$300–$349","$350–$399","$400–$499","$500+"
-- date_or_date_range (optional)
 - name (required)
 - email (required)
 - phone (optional)
-- notes (optional, short phrases only)
+- notes (optional; short phrases only)
+Notes:
+- Do NOT ask for date/date-range or budget. If the user volunteers them, keep them as optional extras.
+- Do NOT ask what “type” of show before recommending events (no categories like high-energy vs acoustic). You don’t have categorized lists.
+- Ask for missing required fields one at a time.
+- When the user confirms the summary, CALL capture_ticket_request immediately.
+
 
 RESTRICTIONS & IMPORTANT RULES
 - Never ask for City/Residence
@@ -813,7 +823,7 @@ Remember: You're the cool, knowledgeable friend who's genuinely excited to help 
               phone: { type: "string" },
               notes: { type: "string" }
             },
-            required: ["artist_or_event", "ticket_qty", "budget_tier", "name", "email"]
+            required: ["artist_or_event", "ticket_qty","name", "email"]
           }
         }
       }
