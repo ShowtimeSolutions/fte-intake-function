@@ -318,13 +318,13 @@ TONE
 `.trim();
 
   const body = {
-    model: "gpt-4o-mini", // Fixed model name
+    model: "gpt-4o-mini",
     temperature: 0.2,
-    messages: [{ role: "system", content: sysPrompt }, ...messages], // Fixed: use 'messages' not 'input'
+    messages: [{ role: "system", content: sysPrompt }, ...messages],
     tools: [
       {
         type: "function",
-        function: { // Fixed: wrap in 'function' object
+        function: {
           name: "capture_ticket_request",
           description: "Finalize a ticket request and log to Google Sheets.",
           parameters: {
@@ -352,7 +352,7 @@ TONE
       },
       {
         type: "function",
-        function: { // Fixed: wrap in 'function' object
+        function: {
           name: "web_search",
           description: "Search the web for events, venues, dates, ticket info, or prices.",
           parameters: {
@@ -403,7 +403,7 @@ function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg |
 function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
 function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
 
-/* =====================  Azure Function entry - WITH FORM SUPPORT  ===================== */
+/* =====================  Azure Function entry - WITH MINIMAL FORM SUPPORT  ===================== */
 module.exports = async function (context, req) {
   context.res = {
     headers: {
@@ -421,7 +421,7 @@ module.exports = async function (context, req) {
   }
 
   try {
-    // ✅ NEW: Handle direct form submissions
+    //  MINIMAL ADDITION: Handle direct form submissions FIRST
     if (req.body?.direct_capture && req.body?.capture) {
       try {
         const formData = req.body.capture;
@@ -442,7 +442,7 @@ module.exports = async function (context, req) {
       }
     }
 
-    // ✅ EXISTING: Handle chatbot messages
+    //  EXISTING WORKING CHATBOT CODE (UNCHANGED)
     const { messages = [] } = req.body || {};
     
     if (!Array.isArray(messages) || messages.length === 0) {
