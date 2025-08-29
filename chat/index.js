@@ -418,6 +418,17 @@ module.exports = async function (context, req) {
     context.res.body = {};
     return;
   }
+  if (req.body?.direct_capture && req.body?.capture) {
+    try {
+      await appendToSheet(toRow(req.body.capture));  // <- writes A..I columns
+      context.res.status = 200;
+      context.res.body = { message: "Saved your request. We’ll follow up soon!" };
+    } catch (e) {
+      context.res.status = 500;
+      context.res.body = { error: String(e) };
+    }
+    return;
+  }
 
   try {
     const { messages = [] } = req.body || {};
