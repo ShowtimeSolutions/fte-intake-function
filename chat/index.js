@@ -411,7 +411,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Delvon Lamarr Organ Trio", venue: "Evanston Space", date: "2025-09-10" },
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-10" },
   { artist: "Molly Tuttle", venue: "Thalia Hall", date: "2025-09-10" },
-  { artist: "Castle Rat", venue: "Reggies Chicago", date: "2025-09-10" }
+  { artist: "Castle Rat", venue: "Reggies Chicago", date: "2025-09-10" },
   { artist: "Infinite 80S   Tribute", venue: "City Winery", date: "2025-09-10" },
   { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-10" },
   { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-10" },
