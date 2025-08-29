@@ -182,6 +182,17 @@ const RECOMMENDED_SHOWS = [
   { artist: "The Weeknd",     venue: "United Center",  date: "2025-10-03" },
 ];
 
+function formatRecs(dateHint) {
+  const norm = (s) => (s || "").toLowerCase();
+  const wanted = norm(dateHint);
+  const upcoming = RECS
+    .filter(r => !wanted || norm(r.date).includes(wanted))
+    .sort((a, b) => new Date(a.date) - new Date(b.date))
+    .slice(0, 3);
+  if (!upcoming.length) return "I don’t have great recs for that date yet. Any artist you’re curious about?";
+  return upcoming.map(r => `${r.artist} @ ${r.venue} on ${r.date}`).join("\n");
+}
+
 function parseDateFromText(text) {
   const m = String(text || "").match(DATE_WORDS);
   if (!m) return null;
