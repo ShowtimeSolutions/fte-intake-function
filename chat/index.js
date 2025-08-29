@@ -654,7 +654,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-20" },
   { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-20" },
   { artist: "Kavita Krishnamurthy", venue: "Hard Rock Casino Northern Indiana", date: "2025-09-20" },
-  { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-20" },
+  { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-20" }
 ];
 
 function formatRecs(dateHint) {
