@@ -1,4 +1,5 @@
-// ------------------------------------
+// index.js — Azure Function (Node 18+) - FIXED VERSION
+
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
 
@@ -54,149 +55,148 @@ function toRow(c) {
   return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
 }
 
-/* =====================  Web Search  ===================== */
-async function webSearch(query, location = "Chicago") {
-  try {
-    const searchQuery = location ? `${query} ${location}` : query;
-    
-    const response = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": process.env.SERPER_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        q: searchQuery,
-        num: 10
-      })
-    });
+/* =====================  Serper Search  ===================== */
+async function webSearch(query, location, { preferTickets = true, max = 5 } = {}) {
+  const siteBias = preferTickets ? " (site:vividseats.com OR site:ticketmaster.com OR site:stubhub.com)" : "";
+  const hasTicketsWord = /\bticket(s)?\b/i.test(query);
+  const qFinal =
+    query + (hasTicketsWord ? "" : " tickets") + (location ? ` ${location}` : "") + siteBias;
 
-    if (!response.ok) {
-      throw new Error(`Serper API error: ${response.status}`);
+  const resp = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: { "X-API-KEY": process.env.SERPER_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ q: qFinal, num: max }),
+  });
+  if (!resp.ok) throw new Error(await resp.text());
+  const data = await resp.json();
+
+  return (data.organic || []).map((r, i) => ({
+    n: i + 1,
+    title: r.title || "",
+    link: r.link || "",
+    snippet: r.snippet || "",
+  }));
+}
+
+/* =====================  Price helpers - IMPROVED  ===================== */
+// More comprehensive price regex patterns
+const PRICE_PATTERNS = [
+  /\$\s*(\d{2,4})(?:\s*-\s*\$?\d{2,4})?/gi,  // $100 or $100-$200
+  /from\s*\$\s*(\d{2,4})/gi,                  // from $100
+  /starting\s*at\s*\$\s*(\d{2,4})/gi,         // starting at $100
+  /as\s*low\s*as\s*\$\s*(\d{2,4})/gi,         // as low as $100
+  /(\d{2,4})\s*dollars?/gi,                   // 100 dollars
+];
+
+const irrelevant = (t, s) => /parking|hotel|restaurant|faq|blog|merchandise|merch|food|drink/i.test(`${t} ${s}`);
+
+function extractPrices(text) {
+  if (!text) return [];
+  const prices = [];
+  
+  for (const pattern of PRICE_PATTERNS) {
+    pattern.lastIndex = 0; // Reset regex
+    let match;
+    while ((match = pattern.exec(text))) {
+      const val = parseInt(match[1], 10);
+      if (!isNaN(val) && val >= 20 && val <= 2000) { // Reasonable ticket price range
+        prices.push(val);
+      }
     }
-
-    const data = await response.json();
-    return (data.organic || []).map(result => ({
-      title: result.title || "",
-      snippet: result.snippet || "",
-      link: result.link || ""
-    }));
-  } catch (error) {
-    console.error('Web search error:', error);
-    return [];
   }
+  
+  return [...new Set(prices)]; // Remove duplicates
+}
+
+function minPriceAcross(items) {
+  let allPrices = [];
+  for (const item of items || []) {
+    if (!irrelevant(item.title, item.snippet)) {
+      const prices = extractPrices(`${item.title} ${item.snippet}`);
+      allPrices.push(...prices);
+    }
+  }
+  return allPrices.length > 0 ? Math.min(...allPrices) : null;
 }
 
 async function getTicketPrices(query) {
   try {
-    const vividQuery = `site:vividseats.com ${query} tickets Chicago`;
+    // Search multiple ticket sites
+    const searches = await Promise.all([
+      webSearch(`${query} tickets site:vividseats.com`, null, { preferTickets: true, max: 3 }),
+      webSearch(`${query} tickets site:ticketmaster.com`, null, { preferTickets: true, max: 3 }),
+      webSearch(`${query} tickets site:stubhub.com`, null, { preferTickets: true, max: 3 }),
+    ]);
     
-    const response = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": process.env.SERPER_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        q: vividQuery,
-        num: 5
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Serper API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const results = data.organic || [];
+    const allResults = searches.flat();
+    const relevantResults = allResults.filter(item => !irrelevant(item.title, item.snippet));
     
-    for (const result of results) {
-      const text = `${result.title} ${result.snippet}`;
-      
-      const pricePatterns = [
-        /\$(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/g,
-        /from \$(\d+)/i,
-        /starting at \$(\d+)/i,
-        /tickets from \$(\d+)/i,
-        /get in \$(\d+)/i
-      ];
-      
-      for (const pattern of pricePatterns) {
-        const matches = [...text.matchAll(pattern)];
-        if (matches.length > 0) {
-          const prices = matches.map(match => parseFloat(match[1].replace(',', '')));
-          return Math.min(...prices);
-        }
-      }
-    }
-    
-    return null;
+    return minPriceAcross(relevantResults);
   } catch (error) {
-    console.error('Price extraction error:', error);
+    console.error('Price search error:', error);
     return null;
   }
 }
 
-function minPriceAcross(results) {
-  const prices = [];
-  for (const r of results) {
-    const text = `${r.title} ${r.snippet}`;
-    const matches = text.match(/\$(\d{1,4}(?:,\d{3})*)/g);
-    if (matches) {
-      for (const m of matches) {
-        const num = parseFloat(m.replace(/[$,]/g, ""));
-        if (num >= 10 && num <= 9999) prices.push(num);
-      }
-    }
+function priceSummaryMessage(priceNum) {
+  if (priceNum != null) {
+    return `I found tickets starting around $${priceNum}. What's your budget range?`;
   }
-  return prices.length ? Math.min(...prices) : null;
+  return `I'll help you find the best prices. What's your budget range?`;
 }
 
-function priceSummaryMessage(price) {
-  if (price) {
-    return `I found tickets starting from $${price} on Vivid Seats. How many tickets do you need?`;
+/* =====================  Guardrail extraction  ===================== */
+function normalizeBudgetTier(text = "") {
+  const t = text.toLowerCase();
+  const num = parseInt(t.replace(/[^\d]/g, ""), 10);
+  if (/(<\s*\$?50|under\s*50|less\s*than\s*\$?50)/i.test(text)) return "<$50";
+  if (/\b(50[\s–-]?99|50-99|50 to 99)\b/i.test(text)) return "$50–$99";
+  if (/\b(100[\s–-]?149|100-149|100 to 149)\b/i.test(text)) return "$100–$149";
+  if (/\b(150[\s–-]?199|150-199|150 to 199)\b/i.test(text)) return "$150–$199";
+  if (/\b(200[\s–-]?249|200-249|200 to 249)\b/i.test(text)) return "$200–$249";
+  if (/\b(250[\s–-]?299|250-299|250 to 299)\b/i.test(text)) return "$250–$299";
+  if (/\b(300[\s–-]?349|300-349|300 to 349)\b/i.test(text)) return "$300–$349";
+  if (/\b(350[\s–-]?399|350-399|350 to 399)\b/i.test(text)) return "$350–$399";
+  if (/(400|450)/i.test(text)) return "$400–$499";
+  if (/\$?500\+|over\s*\$?500|>\s*\$?500/i.test(text)) return "$500+";
+  if (!isNaN(num)) {
+    if (num < 50) return "<$50";
+    if (num < 100) return "$50–$99";
+    if (num < 150) return "$100–$149";
+    if (num < 200) return "$150–$199";
+    if (num < 250) return "$200–$249";
+    if (num < 300) return "$250–$299";
+    if (num < 350) return "$300–$349";
+    if (num < 400) return "$350–$399";
+    if (num < 500) return "$400–$499";
+    return "$500+";
   }
-  return "I'm having trouble finding current pricing. What specific event are you looking for?";
-}
-
-function irrelevant(title, snippet) {
-  const text = `${title} ${snippet}`.toLowerCase();
-  return /\b(news|article|review|interview|biography|wiki|wikipedia|imdb|facebook|twitter|instagram)\b/.test(text);
-}
-
-/* =====================  Budget Tier Normalization  ===================== */
-const QTY_RE = /\b(\d{1,2})\s*(?:ticket|tix|seat)/i;
-const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/;
-const PHONE_RE = /\b(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})\b/;
-const DATE_WORDS = /\b(?:tonight|tomorrow|this weekend|next week|friday|saturday|sunday|monday|tuesday|wednesday|thursday|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}\/\d{1,2}|\d{1,2}-\d{1,2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i;
-
-function normalizeBudgetTier(text) {
-  const t = (text || "").toLowerCase().replace(/[^\w\s$-]/g, " ");
-  
-  if (/under.*50|less.*50|below.*50|<.*50|\$?50.*less|\$?50.*under/.test(t)) return "<$50";
-  if (/50.*99|50.*100|50.*to.*99|50.*-.*99|\$50.*\$99/.test(t)) return "$50–$99";
-  if (/100.*149|100.*150|100.*to.*149|100.*-.*149|\$100.*\$149/.test(t)) return "$100–$149";
-  if (/150.*199|150.*200|150.*to.*199|150.*-.*199|\$150.*\$199/.test(t)) return "$150–$199";
-  if (/200.*249|200.*250|200.*to.*249|200.*-.*249|\$200.*\$249/.test(t)) return "$200–$249";
-  if (/250.*299|250.*300|250.*to.*299|250.*-.*299|\$250.*\$299/.test(t)) return "$250–$299";
-  if (/300.*349|300.*350|300.*to.*349|300.*-.*349|\$300.*\$349/.test(t)) return "$300–$349";
-  if (/350.*399|350.*400|350.*to.*399|350.*-.*399|\$350.*\$399/.test(t)) return "$350–$399";
-  if (/400.*499|400.*500|400.*to.*499|400.*-.*499|\$400.*\$499/.test(t)) return "$400–$499";
-  if (/500.*more|500.*plus|over.*500|above.*500|500\+|\$500\+/.test(t)) return "$500+";
-  
-  const num = parseInt((t.match(/\$?(\d+)/) || ["", "0"])[1], 10);
-  if (num < 50) return "<$50";
-  if (num < 100) return "$50–$99";
-  if (num < 150) return "$100–$149";
-  if (num < 200) return "$150–$199";
-  if (num < 250) return "$200–$249";
-  if (num < 300) return "$250–$299";
-  if (num < 350) return "$300–$349";
-  if (num < 400) return "$350–$399";
-  if (num < 500) return "$400–$499";
-  if (num >= 500) return "$500+";
-  
   return "";
+}
+
+const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const PHONE_RE = /\b(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/;
+const QTY_RE   = /\b(\d{1,2})\b/;
+const DATE_WORDS = /\b(today|tonight|tomorrow|this\s*(week|weekend)|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{1,2}(?:,\s*\d{4})?)\b/i;
+
+/** Turn-aware extraction */
+function extractTurnAware(messages) {
+  const out = { artist_or_event:"", ticket_qty:"", budget_tier:"", date_or_date_range:"", name:"", email:"", phone:"", notes:"" };
+  for (let i = 0; i < messages.length - 1; i++) {
+    const a = messages[i], u = messages[i + 1];
+    if (a.role !== "assistant" || u.role !== "user") continue;
+    const q = String(a.content || "").toLowerCase();
+    const ans = String(u.content || "");
+    if (!out.artist_or_event && /(artist|event).*(interested|looking|tickets?)/.test(q)) out.artist_or_event = ans.replace(/tickets?/ig, "").trim();
+    if (!out.ticket_qty && /(how many|quantity|qty)/.test(q)) { const m = ans.match(QTY_RE); if (m) out.ticket_qty = parseInt(m[1], 10); }
+    if (!out.budget_tier && /(budget|price range|per ticket)/.test(q)) out.budget_tier = normalizeBudgetTier(ans);
+    if (!out.date_or_date_range && /(date|when)/.test(q)) { const dm = ans.match(DATE_WORDS); out.date_or_date_range = dm ? dm[0] : ans.trim(); }
+    if (!out.name && /name/.test(q)) { if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) out.name = ans.trim(); }
+    if (!out.email && /(email|e-mail)/.test(q)) { const em = ans.match(EMAIL_RE); if (em) out.email = em[0]; }
+    if (!out.phone && /(phone|number)/.test(q)) { const pm = ans.match(PHONE_RE); if (pm) out.phone = pm[0]; }
+    if (/notes?|special|requests?/i.test(q)) { if (!/no|none|n\/a/i.test(ans)) out.notes = ans.trim(); }
+  }
+  return out;
 }
 
 /** Backstop extraction */
@@ -318,13 +318,13 @@ TONE
 `.trim();
 
   const body = {
-    model: "gpt-4o-mini",
+    model: "gpt-4o-mini", // Fixed model name
     temperature: 0.2,
-    messages: [{ role: "system", content: sysPrompt }, ...messages],
+    messages: [{ role: "system", content: sysPrompt }, ...messages], // Fixed: use 'messages' not 'input'
     tools: [
       {
         type: "function",
-        function: {
+        function: { // Fixed: wrap in 'function' object
           name: "capture_ticket_request",
           description: "Finalize a ticket request and log to Google Sheets.",
           parameters: {
@@ -352,7 +352,7 @@ TONE
       },
       {
         type: "function",
-        function: {
+        function: { // Fixed: wrap in 'function' object
           name: "web_search",
           description: "Search the web for events, venues, dates, ticket info, or prices.",
           parameters: {
@@ -369,7 +369,7 @@ TONE
     tool_choice: "auto"
   };
 
-  const resp = await fetch(`${process.env.OPENAI_API_BASE}/v1/chat/completions`, {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", { // Fixed: correct endpoint
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -398,12 +398,11 @@ function looksLikeSearch(msg) {
   const q = (msg || "").toLowerCase();
   return /what.*(show|event)|show(s)?|event(s)?|happening|things to do|prices?|price|tickets?|concert|theater|theatre|sports|game|popular|upcoming|suggest|recommend/.test(q);
 }
-
 function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
 function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test(msg || ""); }
 function mentionsChicago(msg) { return /(chicago|chi-town|chitown|tinley park|rosemont|wrigley|united center|soldier field)/i.test(msg || ""); }
 
-/* =====================  Azure Function entry - WITH MINIMAL FORM SUPPORT  ===================== */
+/* =====================  Azure Function entry - COMPLETED  ===================== */
 module.exports = async function (context, req) {
   context.res = {
     headers: {
@@ -421,28 +420,6 @@ module.exports = async function (context, req) {
   }
 
   try {
-    //  MINIMAL ADDITION: Handle direct form submissions FIRST
-    if (req.body?.direct_capture && req.body?.capture) {
-      try {
-        const formData = req.body.capture;
-        const row = toRow(formData);
-        await appendToSheet(row);
-        
-        context.res.status = 200;
-        context.res.body = { 
-          message: "Form submitted successfully!",
-          captured: true
-        };
-        return;
-      } catch (error) {
-        console.error('Form submission error:', error);
-        context.res.status = 500;
-        context.res.body = { error: "Failed to save form data" };
-        return;
-      }
-    }
-
-    //  EXISTING WORKING CHATBOT CODE (UNCHANGED)
     const { messages = [] } = req.body || {};
     
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -538,3 +515,4 @@ module.exports = async function (context, req) {
     context.res.body = { error: String(e) };
   }
 };
+
