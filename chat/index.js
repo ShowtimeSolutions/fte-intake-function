@@ -314,7 +314,25 @@ function getAssistantText(openaiResp) {
 
 /* =====================  Intent helpers  ===================== */
 function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
-function wantsSuggestions(msg) { return /(suggest|recommend|popular|upcoming|what.*to do|what.*going on|ideas)/i.test((msg||"").toLowerCase()); }
+function wantsSuggestions(msg = "") {
+  const q = (msg || "").toLowerCase();
+
+  // common words/phrases + misspellings + short forms
+  const patterns = [
+    /recomm?end(ation|ations|ed|ing)?/,   // recommend / recomend / recommendation(s)
+    /\brecs?\b/,                          // rec / recs
+    /\brecos?\b/,                         // reco / recos
+    /\bsuggest(ion|ions|ed|ing)?\b/,      // suggest / suggestions
+    /\bideas?\b/,                         // idea / ideas
+    /what.*(to do|going on|happening)/,   // what's to do / what's going on / what's happening
+    /\b(any )?(good )?(shows?|events?)\b/,// any (good) shows/events
+    /(coming up.*show|show.*coming up)/,  // show coming up?
+    /\bupcoming\b/                        // upcoming
+  ];
+
+  return patterns.some((re) => re.test(q));
+}
+
 
 /* =====================  Azure Function entry  ===================== */
 module.exports = async function (context, req) {
