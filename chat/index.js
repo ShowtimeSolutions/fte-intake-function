@@ -419,6 +419,28 @@ module.exports = async function (context, req) {
     return;
   }
 
+ try {
+    //  NEW: Handle direct form submissions
+    if (req.body?.direct_capture && req.body?.capture) {
+      try {
+        const formData = req.body.capture;
+        const row = toRow(formData);
+        await appendToSheet(row);
+        
+        context.res.status = 200;
+        context.res.body = { 
+          message: "Form submitted successfully!",
+          captured: true
+        };
+        return;
+      } catch (error) {
+        console.error('Form submission error:', error);
+        context.res.status = 500;
+        context.res.body = { error: "Failed to save form data" };
+        return;
+      }
+    }
+  
   try {
     const { messages = [] } = req.body || {};
     
