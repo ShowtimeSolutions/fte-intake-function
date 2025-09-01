@@ -795,7 +795,7 @@ Remember: You're the cool, knowledgeable friend who's genuinely excited to help 
 `;
 
   const body = {
-    model: "gpt-4o-mini",
+    model: "gpt-5",
     temperature: 0.2,
     messages: [{ role: "system", content: sysPrompt }, ...messages],
     tools: [
