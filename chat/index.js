@@ -725,7 +725,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-20" },
   { artist: "Kavita Krishnamurthy", venue: "Hard Rock Casino Northern Indiana", date: "2025-09-20" },
   { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-20" },
-    { artist: "Wiz Khalifa", venue: "Amphitheater At Founders Square", date: "2025-09-20" },
+  { artist: "Wiz Khalifa", venue: "Amphitheater At Founders Square", date: "2025-09-20" },
   { artist: "Badshah", venue: "Estates Now Arena", date: "2025-09-20" },
   { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-20" },
   { artist: "Chicago Bears", venue: "Field", date: "2026-03-04" },
@@ -957,9 +957,6 @@ const RECOMMENDED_SHOWS = [
   { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-28" },
   { artist: "Northwestern Wildcats Womens Volleyball", venue: "Ryan Arena", date: "2025-09-28" },
   { artist: "Chicago Symphony Orchestra", venue: "Chicago Symphony Center", date: "2025-09-28" },
-];
-
-
 ];
 
 function formatRecs(dateHint) {
