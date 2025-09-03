@@ -3,9 +3,9 @@
 
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
+const nodemailer = require("nodemailer");
 
-/* ===================== Google Sheets ===================== */
-
+/* =====================  Google Sheets  ===================== */
 async function getSheetsClient() {
   const creds = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
   const auth = new google.auth.JWT(
@@ -13,7 +13,7 @@ async function getSheetsClient() {
     null,
     creds.private_key,
     ["https://www.googleapis.com/auth/spreadsheets"]
-   );
+  );
   await auth.authorize();
   return google.sheets({ version: "v4", auth });
 }
@@ -32,31 +32,32 @@ async function appendToSheet(row) {
 
 /**
  * Unified row (A..I):
- * A Timestamp
- * B Artist_or_event
- * C Ticket_qty
- * D Budget_tier
- * E Date_or_date_range
- * F Name
- * G Email
- * H Phone
- * I Notes
+ *  A Timestamp
+ *  B Artist_or_event
+ *  C Ticket_qty
+ *  D Budget_tier
+ *  E Date_or_date_range
+ *  F Name
+ *  G Email
+ *  H Phone
+ *  I Notes
  */
 function toRow(c) {
   const ts = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" }); // A
-  const artist = c?.artist_or_event || ""; // B
-  const qty = Number.isFinite(c?.ticket_qty) ? c.ticket_qty : (parseInt(c?.ticket_qty || "", 10) || ""); // C
-  const budgetTier = c?.budget_tier || c?.budget || ""; // D
-  const dateRange = c?.date_or_date_range || ""; // E
-  const name = c?.name || ""; // F
-  const email = c?.email || ""; // G
-  const phone = c?.phone || ""; // H
-  const notes = c?.notes || ""; // I
+  const artist = c?.artist_or_event || "";                                        // B
+  const qty = Number.isFinite(c?.ticket_qty)
+    ? c.ticket_qty
+    : (parseInt(c?.ticket_qty || "", 10) || "");                                   // C
+  const budgetTier = c?.budget_tier || c?.budget || "";                            // D
+  const dateRange = c?.date_or_date_range || "";                                   // E
+  const name = c?.name || "";                                                      // F
+  const email = c?.email || "";                                                    // G
+  const phone = c?.phone || "";                                                    // H
+  const notes = c?.notes || "";                                                    // I
   return [ts, artist, qty, budgetTier, dateRange, name, email, phone, notes];
 }
 
-/* ===================== Budget tiering ===================== */
-
+/* =====================  Budget tiering  ===================== */
 function normalizeBudgetTier(text = "") {
   const t = text.toLowerCase();
   const num = parseInt(t.replace(/[^\d]/g, ""), 10);
@@ -89,48 +90,99 @@ function normalizeBudgetTier(text = "") {
 
 const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
 const PHONE_RE = /\b(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/;
-const QTY_RE = /\b(\d{1,2})\b/;
+const QTY_RE   = /\b(\d{1,2})\b/;
 const DATE_WORDS = /\b(today|tonight|tomorrow|this\s*(week|weekend)|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{1,2}(?:,\s*\d{4})?)\b/i;
 
-/** Turn-aware extraction */
+/* =====================  Gmail confirmation  ===================== */
+function buildConfirmationEmail(c) {
+  const artist = c.artist_or_event || "your event";
+  const qty = c.ticket_qty || "?";
+  const budget = normalizeBudgetTier(c.budget_tier || c.budget || "") || "—";
+  const date = c.date_or_date_range || "TBD";
+  const name = c.name || "there";
+
+  const subject = `We got your request: ${artist}`;
+  const text =
+`Hey ${name},
+
+Thanks for using Fair Ticket Exchange!
+We’ve logged your request:
+
+• Artist/Event: ${artist}
+• Qty: ${qty}
+• Date/Range: ${date}
+• Budget: ${budget}
+• Notes: ${c.notes || "—"}
+
+Our team will follow up by email with options.`;
+
+  const html = `
+  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.5;">
+    <p>Hey ${name},</p>
+    <p>Thanks for using <strong>Fair Ticket Exchange</strong>! We’ve logged your request:</p>
+    <ul>
+      <li><strong>Artist/Event:</strong> ${artist}</li>
+      <li><strong>Qty:</strong> ${qty}</li>
+      <li><strong>Date/Range:</strong> ${date}</li>
+      <li><strong>Budget:</strong> ${budget}</li>
+      <li><strong>Notes:</strong> ${c.notes || "—"}</li>
+    </ul>
+    <p>Our team will follow up by email with the best options.</p>
+    <p style="color:#7a7a7a;">— FTE Team</p>
+  </div>`;
+  return { subject, text, html };
+}
+
+async function sendConfirmationEmail(c) {
+  // No-op if email isn't configured
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD || !c?.email) return;
+
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: process.env.GMAIL_APP_PASSWORD,
+    },
+  });
+
+  const { subject, text, html } = buildConfirmationEmail(c);
+  const from = process.env.GMAIL_FROM || process.env.GMAIL_USER;
+  const replyTo = process.env.GMAIL_REPLY_TO || from;
+  const bcc = process.env.GMAIL_BCC || undefined;
+
+  await transporter.sendMail({
+    from,
+    to: c.email,
+    bcc,
+    replyTo,
+    subject,
+    text,
+    html,
+  });
+}
+
+/* =====================  Turn-aware extraction  ===================== */
 function extractTurnAware(messages) {
   const out = { artist_or_event:"", ticket_qty:"", budget_tier:"", date_or_date_range:"", name:"", email:"", phone:"", notes:"" };
   for (let i = 0; i < messages.length - 1; i++) {
     const a = messages[i], u = messages[i + 1];
     if (a.role !== "assistant" || u.role !== "user") continue;
-
     const q = String(a.content || "").toLowerCase();
     const ans = String(u.content || "");
 
     if (!out.artist_or_event && /(artist|event).*(interested|looking|tickets?)/.test(q)) out.artist_or_event = ans.replace(/tickets?/ig, "").trim();
-    if (!out.ticket_qty && /(how many|quantity|qty)/.test(q)) {
-      const m = ans.match(QTY_RE);
-      if (m) out.ticket_qty = parseInt(m[1], 10);
-    }
+    if (!out.ticket_qty && /(how many|quantity|qty)/.test(q)) { const m = ans.match(QTY_RE); if (m) out.ticket_qty = parseInt(m[1], 10); }
     if (!out.budget_tier && /(budget|price range|per ticket)/.test(q)) out.budget_tier = normalizeBudgetTier(ans);
-    if (!out.date_or_date_range && /(date|when)/.test(q)) {
-      const dm = ans.match(DATE_WORDS);
-      out.date_or_date_range = dm ? dm[0] : ans.trim();
-    }
-    if (!out.name && /name/.test(q)) {
-      if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) out.name = ans.trim();
-    }
-    if (!out.email && /(email|e-mail)/.test(q)) {
-      const em = ans.match(EMAIL_RE);
-      if (em) out.email = em[0];
-    }
-    if (!out.phone && /(phone|number)/.test(q)) {
-      const pm = ans.match(PHONE_RE);
-      if (pm) out.phone = pm[0];
-    }
-    if (/notes?|special|requests?/i.test(q)) {
-      if (!/no|none|n\/a/i.test(ans)) out.notes = ans.trim();
-    }
+    if (!out.date_or_date_range && /(date|when)/.test(q)) { const dm = ans.match(DATE_WORDS); out.date_or_date_range = dm ? dm[0] : ans.trim(); }
+    if (!out.name && /name/.test(q)) { if (!EMAIL_RE.test(ans) && !PHONE_RE.test(ans)) out.name = ans.trim(); }
+    if (!out.email && /(email|e-mail)/.test(q)) { const em = ans.match(EMAIL_RE); if (em) out.email = em[0]; }
+    if (!out.phone && /(phone|number)/.test(q)) { const pm = ans.match(PHONE_RE); if (pm) out.phone = pm[0]; }
+    if (/notes?|special|requests?/i.test(q)) { if (!/no|none|n\/a/i.test(ans)) out.notes = ans.trim(); }
   }
   return out;
 }
 
-/** Backstop extraction */
+/* =====================  Backstop extraction  ===================== */
 function extractFromTranscript(messages) {
   const userTexts = messages.filter(m => m.role === "user").map(m => String(m.content||""));
   const allText = messages.map(m => String(m.content || "")).join("\n");
@@ -138,10 +190,7 @@ function extractFromTranscript(messages) {
   let artist = "";
   for (const t of userTexts) {
     const m = t.match(/(?:see|want|looking.*for|tickets? for|go to|interested in)\s+(.+)/i);
-    if (m) {
-      artist = m[1].replace(/tickets?$/i, "").trim();
-      break;
-    }
+    if (m) { artist = m[1].replace(/tickets?$/i, "").trim(); break; }
   }
   if (!artist && userTexts.length) artist = userTexts[0].trim();
   if (/^hi|hello|hey$/i.test(artist)) artist = "";
@@ -149,19 +198,13 @@ function extractFromTranscript(messages) {
   let qty = null;
   for (let i = userTexts.length-1; i >= 0; i--) {
     const m = userTexts[i].match(QTY_RE);
-    if (m) {
-      qty = parseInt(m[1], 10);
-      if (qty>0 && qty<=12) break;
-    }
+    if (m) { qty = parseInt(m[1], 10); if (qty>0 && qty<=12) break; }
   }
 
   let budget_tier = "";
   for (let i = userTexts.length-1; i >= 0; i--) {
     const bt = normalizeBudgetTier(userTexts[i]);
-    if (bt) {
-      budget_tier = bt;
-      break;
-    }
+    if (bt) { budget_tier = bt; break; }
   }
 
   let date_or_date_range = "";
@@ -192,33 +235,30 @@ function extractFromTranscript(messages) {
 function haveRequired(c) {
   return !!(c.artist_or_event && c.ticket_qty && c.name && c.email);
 }
-
 function userConfirmed(text) {
   return /\b(yes|yep|yeah|correct|confirm|finalize|go ahead|proceed|place it|submit|that's right|looks good|do it|book it)\b/i.test(text || "");
 }
-
 function userAskedForm(text) {
   return /\b(open|use|show)\b.*\b(form)\b|\bmanual request\b/i.test(text || "");
 }
 
-/* ===================== Hard-coded recommendations ===================== */
-
-/** Edit/extend this list whenever you like. Use ISO dates. */
+/* =====================  Hard-coded recommendations  ===================== */
+// Keep your big list here; a few placeholders so the code runs.
 const RECOMMENDED_SHOWS = [
   { artist: "Damon Darling", venue: "Zanies Comedy Club Rosemont", date: "2025-08-30" },
   { artist: "Mc Magic", venue: "Vic Theatre", date: "2025-08-30" },
   { artist: "Trace Adkins", venue: "Park Centennial Park West", date: "2025-08-30" },
   { artist: "Adam Beyer", venue: "Prysm Nightclub", date: "2025-08-30" },
   { artist: "Of The Trees", venue: "Garcias Chicago", date: "2025-08-30" },
-  { artist: "Whiskey Friends Tribute To Morgan Wallen", venue: "City Live At The Lakefront", date: "2025-08-30" },
+  { artist: "Whiskey Friends   Tribute To Morgan Wallen", venue: "City Live At The Lakefront", date: "2025-08-30" },
   { artist: "Atliens", venue: "Joes On Weed Street", date: "2025-08-30" },
   { artist: "The Whispers", venue: "Club Hills Country Club Hills Theater", date: "2025-08-30" },
   { artist: "Nghtmre", venue: "Tao Chicago", date: "2025-08-30" },
   { artist: "Fromis 9", venue: "Chicago Theatre", date: "2025-08-30" },
   { artist: "Nate Jackson", venue: "Chicago Improv", date: "2025-08-30" },
   { artist: "Excision", venue: "House Of Blues Chicago", date: "2025-08-30" },
-  { artist: "Peephole System Of A Down Tribute", venue: "Cubby Bear", date: "2025-08-30" },
-  { artist: "Twihard A Twilight Musical Parody", venue: "Apollo Theater Chicago", date: "2025-08-30" },
+  { artist: "Peephole   System Of A Down Tribute", venue: "Cubby Bear", date: "2025-08-30" },
+  { artist: "Twihard   A Twilight Musical Parody", venue: "Apollo Theater Chicago", date: "2025-08-30" },
   { artist: "Come From Away", venue: "Paramount Theatre Aurora", date: "2025-08-30" },
   { artist: "Come From Away", venue: "Paramount Theatre Aurora", date: "2025-08-30" },
   { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-08-30" },
@@ -237,7 +277,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Oliver", venue: "Beverly Arts Center", date: "2025-08-31" },
   { artist: "Come From Away", venue: "Paramount Theatre Aurora", date: "2025-08-31" },
   { artist: "Come From Away", venue: "Paramount Theatre Aurora", date: "2025-08-31" },
-  { artist: "Twihard A Twilight Musical Parody", venue: "Apollo Theater Chicago", date: "2025-08-31" },
+  { artist: "Twihard   A Twilight Musical Parody", venue: "Apollo Theater Chicago", date: "2025-08-31" },
   { artist: "La Original Banda El Limon", venue: "Park Ravinia", date: "2025-08-31" },
   { artist: "Demetria Taylor", venue: "Buddy Guys Legends", date: "2025-08-31" },
   { artist: "New Colony Six", venue: "Charles Arcada Theatre", date: "2025-08-31" },
@@ -267,7 +307,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Lloyd Cole", venue: "City Winery", date: "2025-09-02" },
   { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-02" },
   { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-02" },
-  { artist: "44 The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-02" },
+  { artist: "44   The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-02" },
   { artist: "Hokusai Exhibition", venue: "Ellyn Cleve Carney Museum Of Art", date: "2025-09-02" },
   { artist: "Drunk Shakespeare", venue: "The Lion Theatre", date: "2025-09-02" },
   { artist: "Chicago Architecture Center River Cruise Aboard Chicagos First Lady", venue: "Chicagos First Lady", date: "2025-09-02" },
@@ -277,7 +317,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Kofi B", venue: "City Winery", date: "2025-09-03" },
   { artist: "Chicago Sky", venue: "Arena", date: "2025-09-03" },
   { artist: "Finn Wolfhard", venue: "Thalia Hall", date: "2025-09-03" },
-  { artist: "Red Hot Chilli Pipers Tribute", venue: "North Shore Center", date: "2025-09-03" },
+  { artist: "Red Hot Chilli Pipers   Tribute", venue: "North Shore Center", date: "2025-09-03" },
   { artist: "Come From Away", venue: "Paramount Theatre Aurora", date: "2025-09-03" },
   { artist: "Come From Away", venue: "Paramount Theatre Aurora", date: "2025-09-03" },
   { artist: "Tsushimamire", venue: "Empty Bottle", date: "2025-09-03" },
@@ -287,7 +327,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-03" },
   { artist: "3L3D3P", venue: "Beat Kitchen", date: "2025-09-03" },
   { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-03" },
-  { artist: "44 The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-03" },
+  { artist: "44   The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-03" },
   { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-03" },
   { artist: "Hokusai Exhibition", venue: "Ellyn Cleve Carney Museum Of Art", date: "2025-09-03" },
   { artist: "Drunk Shakespeare", venue: "The Lion Theatre", date: "2025-09-03" },
@@ -303,11 +343,11 @@ const RECOMMENDED_SHOWS = [
   { artist: "Magnolia Boulevard", venue: "Fitzgeralds Berwyn", date: "2025-09-04" },
   { artist: "Mckinley Dixon", venue: "Schubas", date: "2025-09-04" },
   { artist: "Aj Lee And Blue Summit", venue: "Old Town School Of Folk", date: "2025-09-04" },
-  { artist: "Bee Gees Gold A Tribute To The Bee Gees", venue: "Charles Arcada Theatre", date: "2025-09-04" },
+  { artist: "Bee Gees Gold   A Tribute To The Bee Gees", venue: "Charles Arcada Theatre", date: "2025-09-04" },
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-04" },
   { artist: "Catch Me If You Can", venue: "Marriott Theatre Lincolnshire", date: "2025-09-04" },
   { artist: "Louden Swain", venue: "Beat Kitchen", date: "2025-09-04" },
-  { artist: "The Sideguys David Sanborn Tribute", venue: "City Winery", date: "2025-09-04" },
+  { artist: "The Sideguys   David Sanborn Tribute", venue: "City Winery", date: "2025-09-04" },
   { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-04" },
   { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-04" },
   { artist: "Wait Wait Dont Tell Me", venue: "Studebaker Theater", date: "2025-09-04" },
@@ -319,11 +359,11 @@ const RECOMMENDED_SHOWS = [
   { artist: "Hokusai Exhibition", venue: "Ellyn Cleve Carney Museum Of Art", date: "2025-09-04" },
   { artist: "Dua Lipa", venue: "United Center", date: "2025-09-05" },
   { artist: "Le Sserafim", venue: "Wintrust Arena", date: "2025-09-05" },
-  { artist: "Wwe World Wrestling Entertainment", venue: "Arena", date: "2025-09-05" },
+  { artist: "Wwe   World Wrestling Entertainment", venue: "Arena", date: "2025-09-05" },
   { artist: "Northwestern Wildcats Football", venue: "Medicine Field At Martin Stadium", date: "2025-09-06" },
   { artist: "Chris Distefano", venue: "Chicago Theatre", date: "2025-09-05" },
   { artist: "Chicago Cubs", venue: "Field", date: "2025-09-05" },
-  { artist: "Pup The Band", venue: "Salt Shed", date: "2025-09-05" },
+  { artist: "Pup   The Band", venue: "Salt Shed", date: "2025-09-05" },
   { artist: "Ani Difranco", venue: "Cahn Auditorium", date: "2025-09-05" },
   { artist: "The Beach Boys", venue: "Genesee Theatre", date: "2025-09-05" },
   { artist: "Twrp", venue: "Thalia Hall", date: "2025-09-05" },
@@ -333,7 +373,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Come From Away", venue: "Paramount Theatre Aurora", date: "2025-09-05" },
   { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-05" },
   { artist: "The Emo Night Tour", venue: "Bottom Lounge", date: "2025-09-05" },
-  { artist: "Kashmir Led Zeppelin Tribute", venue: "Charles Arcada Theatre", date: "2025-09-05" },
+  { artist: "Kashmir   Led Zeppelin Tribute", venue: "Charles Arcada Theatre", date: "2025-09-05" },
   { artist: "10Cc", venue: "Park West", date: "2025-09-05" },
   { artist: "Catch Me If You Can", venue: "Marriott Theatre Lincolnshire", date: "2025-09-05" },
   { artist: "Nrbq", venue: "Evanston Space", date: "2025-09-05" },
@@ -348,7 +388,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Charlie Wilson", venue: "Huntington Bank Pavilion At Northerly Island", date: "2025-09-06" },
   { artist: "Geoff Tate", venue: "Plaines Des Plaines Theatre", date: "2025-09-06" },
   { artist: "Kruder And Dorfmeister", venue: "Auditorium Theatre Chicago", date: "2025-09-06" },
-  { artist: "44 The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-06" },
+  { artist: "44   The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-06" },
   { artist: "Evanston Folk Festival", venue: "Dawes Park", date: "2025-09-06" },
   { artist: "Leonid And Friends", venue: "City Blue Chip Casino", date: "2025-09-06" },
   { artist: "George Porter Jr", venue: "Garcias Chicago", date: "2025-09-06" },
@@ -365,7 +405,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Talking Sopranos", venue: "Athenaeum Center", date: "2025-09-06" },
   { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-06" },
   { artist: "The 30 Party", venue: "House Of Blues Chicago", date: "2025-09-06" },
-  { artist: "The Taylor Party Taylor Swift Tribute", venue: "House Of Blues Chicago", date: "2025-09-06" },
+  { artist: "The Taylor Party   Taylor Swift Tribute", venue: "House Of Blues Chicago", date: "2025-09-06" },
   { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-06" },
   { artist: "The Who", venue: "United Center", date: "2025-09-07" },
   { artist: "Chicago Bears", venue: "Field", date: "2025-08-01" },
@@ -402,11 +442,11 @@ const RECOMMENDED_SHOWS = [
   { artist: "Teddys Jams", venue: "City Winery", date: "2025-09-08" },
   { artist: "The Second City 65 Anniversary Show", venue: "Second City Chicago", date: "2025-09-08" },
   { artist: "Drunk Shakespeare", venue: "The Lion Theatre", date: "2025-09-08" },
-  { artist: "Cirque Italia Water Circus", venue: "Northfield Square Mall", date: "2025-09-08" },
+  { artist: "Cirque Italia   Water Circus", venue: "Northfield Square Mall", date: "2025-09-08" },
   { artist: "Chicago Architecture Center River Cruise Aboard Chicagos First Lady", venue: "Chicagos First Lady", date: "2025-09-08" },
   { artist: "Bonnie Raitt", venue: "Chicago Theatre", date: "2025-09-09" },
   { artist: "Tedeschi Trucks Band", venue: "Huntington Bank Pavilion At Northerly Island", date: "2025-09-09" },
-  { artist: "The Who Rock Band", venue: "United Center", date: "2025-09-09" },
+  { artist: "The Who   Rock Band", venue: "United Center", date: "2025-09-09" },
   { artist: "Waxahatchee", venue: "Salt Shed", date: "2025-09-09" },
   { artist: "Supergrass", venue: "Riviera Theatre", date: "2025-09-09" },
   { artist: "Whose Live Anyway", venue: "Harris Theater", date: "2025-09-09" },
@@ -419,7 +459,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Torri Griffin", venue: "City Winery", date: "2025-09-09" },
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-09" },
   { artist: "Triples", venue: "Vic Theatre", date: "2025-09-09" },
-  { artist: "44 The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-09" },
+  { artist: "44   The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-09" },
   { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-09" },
   { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-09" },
   { artist: "Chicago Architecture Center River Cruise Aboard Chicagos First Lady", venue: "Chicagos First Lady", date: "2025-09-09" },
@@ -442,16 +482,16 @@ const RECOMMENDED_SHOWS = [
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-10" },
   { artist: "Molly Tuttle", venue: "Thalia Hall", date: "2025-09-10" },
   { artist: "Castle Rat", venue: "Reggies Chicago", date: "2025-09-10" },
-  { artist: "Infinite 80S Tribute", venue: "City Winery", date: "2025-09-10" },
+    { artist: "Infinite 80S   Tribute", venue: "City Winery", date: "2025-09-10" },
   { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-10" },
   { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-10" },
-  { artist: "44 The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-10" },
+  { artist: "44   The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-10" },
   { artist: "Chicago Architecture Center River Cruise Aboard Chicagos First Lady", venue: "Chicagos First Lady", date: "2025-09-10" },
   { artist: "Drunk Shakespeare", venue: "The Lion Theatre", date: "2025-09-10" },
   { artist: "Hokusai Exhibition", venue: "Ellyn Cleve Carney Museum Of Art", date: "2025-09-10" },
   { artist: "Chicago Sky", venue: "Arena", date: "2025-09-11" },
   { artist: "The Story So Far", venue: "Salt Shed", date: "2025-09-11" },
-  { artist: "Marcin Marcin Patrzalek", venue: "Park West", date: "2025-09-11" },
+  { artist: "Marcin   Marcin Patrzalek", venue: "Park West", date: "2025-09-11" },
   { artist: "The 502S", venue: "Riviera Theatre", date: "2025-09-11" },
   { artist: "Noah Reid", venue: "Vic Theatre", date: "2025-09-11" },
   { artist: "Chicago White Sox", venue: "Rate Field", date: "2025-09-11" },
@@ -466,7 +506,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-11" },
   { artist: "We Are Scientists", venue: "Empty Bottle", date: "2025-09-11" },
   { artist: "Age Of Madness", venue: "Bottom Lounge", date: "2025-09-11" },
-  { artist: "Free Fallin Tom Petty Tribute", venue: "Charles Arcada Theatre", date: "2025-09-11" },
+  { artist: "Free Fallin   Tom Petty Tribute", venue: "Charles Arcada Theatre", date: "2025-09-11" },
   { artist: "Nikita Nichelle", venue: "City Winery", date: "2025-09-11" },
   { artist: "Darius", venue: "Concord Music Hall", date: "2025-09-11" },
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-11" },
@@ -490,10 +530,10 @@ const RECOMMENDED_SHOWS = [
   { artist: "Mirador", venue: "Metro Chicago", date: "2025-09-12" },
   { artist: "Mariachi Vargas De Tecalitlan", venue: "Auditorium Theatre Chicago", date: "2025-09-12" },
   { artist: "Slow Crush", venue: "Reggies Chicago", date: "2025-09-12" },
-  { artist: "Bob Bobby Ray Simmons Jr", venue: "House Of Blues Chicago", date: "2025-09-12" },
+  { artist: "Bob   Bobby Ray Simmons Jr", venue: "House Of Blues Chicago", date: "2025-09-12" },
   { artist: "Sidepiece", venue: "Recess", date: "2025-09-12" },
   { artist: "Deon Cole", venue: "Hard Rock Casino Northern Indiana", date: "2025-09-12" },
-  { artist: "Ixnay Offspring Tribute Band", venue: "Chicago The Wc Social Club", date: "2025-09-12" },
+  { artist: "Ixnay   Offspring Tribute Band", venue: "Chicago The Wc Social Club", date: "2025-09-12" },
   { artist: "Paul Thorn", venue: "Fitzgeralds Berwyn", date: "2025-09-12" },
   { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-12" },
   { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-12" },
@@ -503,7 +543,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Northwestern Wildcats Football", venue: "Medicine Field At Martin Stadium", date: "2025-06-03" },
   { artist: "Chicago Cubs", venue: "Field", date: "2025-09-13" },
   { artist: "Monster Jam", venue: "Arena", date: "2025-09-13" },
-  { artist: "Mojo Brookzz Dyon Brooks", venue: "Chicago Theatre", date: "2025-09-13" },
+  { artist: "Mojo Brookzz   Dyon Brooks", venue: "Chicago Theatre", date: "2025-09-13" },
   { artist: "Mt Joy", venue: "United Center", date: "2025-09-13" },
   { artist: "Mchenry Music Festival", venue: "Petersen Park", date: "2025-09-13" },
   { artist: "Staind", venue: "Hard Rock Casino Northern Indiana", date: "2025-09-13" },
@@ -578,7 +618,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-16" },
   { artist: "Sandy Redd", venue: "City Winery", date: "2025-09-16" },
   { artist: "Duckwrth", venue: "The Promontory", date: "2025-09-16" },
-  { artist: "44 The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-16" },
+  { artist: "44   The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-16" },
   { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-16" },
   { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-16" },
   { artist: "Liliac", venue: "Dundee Rochaus", date: "2025-09-16" },
@@ -589,9 +629,9 @@ const RECOMMENDED_SHOWS = [
   { artist: "Chicago Architecture Center River Cruise Aboard Chicagos First Lady", venue: "Chicagos First Lady", date: "2025-09-16" },
   { artist: "Micro Wrestling Federation", venue: "Vegas Saloon", date: "2025-09-16" },
   { artist: "Lady Gaga", venue: "United Center", date: "2025-09-17" },
-  { artist: "Alex G Alexander Giannascoli", venue: "Salt Shed", date: "2025-09-17" },
+  { artist: "Alex G   Alexander Giannascoli", venue: "Salt Shed", date: "2025-09-17" },
   { artist: "Spacey Jane", venue: "Lake City The Complex", date: "2025-09-17" },
-    { artist: "Chicago White Sox", venue: "Rate Field", date: "2025-09-17" },
+  { artist: "Chicago White Sox", venue: "Rate Field", date: "2025-09-17" },
   { artist: "Lea Salonga", venue: "Athenaeum Center", date: "2025-09-17" },
   { artist: "Steven Wilson", venue: "Auditorium Theatre Chicago", date: "2025-09-17" },
   { artist: "Foxwarren", venue: "Thalia Hall", date: "2025-09-17" },
@@ -611,7 +651,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-17" },
   { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-17" },
   { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-17" },
-  { artist: "44 The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-17" },
+  { artist: "44   The Unofficial Obama Musical", venue: "Fine Arts Building Chicago", date: "2025-09-17" },
   { artist: "Baths", venue: "Sleeping Village", date: "2025-09-17" },
   { artist: "Lady Gaga", venue: "United Center", date: "2025-09-18" },
   { artist: "Tom Odell", venue: "Vic Theatre", date: "2025-09-23" },
@@ -637,7 +677,7 @@ const RECOMMENDED_SHOWS = [
   { artist: "Mac Sabbath", venue: "Reggies Chicago", date: "2025-09-18" },
   { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-18" },
   { artist: "Walter Trout", venue: "Evanston Space", date: "2025-09-18" },
-  { artist: "The Baseball Project Band", venue: "Thalia Hall", date: "2025-09-18" },
+  { artist: "The Baseball Project   Band", venue: "Thalia Hall", date: "2025-09-18" },
   { artist: "Lorde", venue: "United Center", date: "2025-09-19" },
   { artist: "Luke Bryan", venue: "Grove Berning Family Farms", date: "2025-08-19" },
   { artist: "Riot Fest", venue: "Douglass Park", date: "2025-09-19" },
@@ -684,13 +724,248 @@ const RECOMMENDED_SHOWS = [
   { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-20" },
   { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-20" },
   { artist: "Kavita Krishnamurthy", venue: "Hard Rock Casino Northern Indiana", date: "2025-09-20" },
-  { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-20" }
+  { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-20" },
+    { artist: "Wiz Khalifa", venue: "Amphitheater At Founders Square", date: "2025-09-20" },
+  { artist: "Badshah", venue: "Estates Now Arena", date: "2025-09-20" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-20" },
+  { artist: "Chicago Bears", venue: "Field", date: "2026-03-04" },
+  { artist: "Txt   Tomorrow X Together", venue: "Allstate Arena", date: "2025-09-21" },
+  { artist: "Riot Fest", venue: "Douglass Park", date: "2025-09-21" },
+  { artist: "Prof", venue: "Vic Theatre", date: "2025-09-21" },
+  { artist: "Chicago White Sox", venue: "Rate Field", date: "2025-09-21" },
+  { artist: "Chicago Bears Official Fan Experience Package", venue: "Field", date: "2025-09-21" },
+  { artist: "Hoda Kotb", venue: "Athenaeum Center", date: "2025-09-21" },
+  { artist: "Premium Tailgate Party", venue: "Tailgate Lot", date: "2025-09-21" },
+  { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-21" },
+  { artist: "Beherit", venue: "Dundee Rochaus", date: "2025-09-21" },
+  { artist: "Los Amigos Invisibles", venue: "The Outset", date: "2025-09-21" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-21" },
+  { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-21" },
+  { artist: "Les Greene And The Swayzees", venue: "Fitzgeralds Berwyn", date: "2025-09-21" },
+  { artist: "Les Greene And The Swayzees", venue: "Fitzgeralds Berwyn", date: "2025-09-21" },
+  { artist: "Marky Ramone", venue: "Metro Chicago", date: "2025-09-21" },
+  { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-21" },
+  { artist: "Svyatoslav Vakarchuks", venue: "North Shore Center", date: "2025-09-21" },
+  { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-21" },
+  { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-21" },
+  { artist: "Andrey Makarevich", venue: "North Shore Center", date: "2025-09-21" },
+  { artist: "Debby Boone", venue: "Charles Arcada Theatre", date: "2025-09-21" },
+  { artist: "Country Royalty", venue: "Charles Arcada Theatre", date: "2025-09-21" },
+  { artist: "Country Royalty", venue: "Charles Arcada Theatre", date: "2025-09-21" },
+  { artist: "Didjits", venue: "Empty Bottle", date: "2025-09-21" },
+  { artist: "Kali Uchis", venue: "United Center", date: "2025-09-22" },
+  { artist: "Polo And Pan", venue: "Salt Shed", date: "2025-09-22" },
+  { artist: "Txt   Tomorrow X Together", venue: "Allstate Arena", date: "2025-09-22" },
+  { artist: "Nourished By Time", venue: "Lincoln Hall", date: "2025-09-22" },
+  { artist: "Brian Jonestown Massacre", venue: "Metro Chicago", date: "2025-09-22" },
+  { artist: "The Seven Wonders   Tribute To Fleetwood Mac", venue: "City Winery", date: "2025-09-22" },
+  { artist: "The Second City 65 Anniversary Show", venue: "Second City Chicago", date: "2025-09-22" },
+  { artist: "Drunk Shakespeare", venue: "The Lion Theatre", date: "2025-09-22" },
+  { artist: "Chicago Architecture Center River Cruise Aboard Chicagos First Lady", venue: "Chicagos First Lady", date: "2025-09-22" },
+  { artist: "Kali Uchis", venue: "United Center", date: "2025-09-23" },
+  { artist: "Chicago Cubs", venue: "Field", date: "2025-09-23" },
+  { artist: "Deltron 3030", venue: "House Of Blues Chicago", date: "2025-09-23" },
+  { artist: "Bandalos Chinos", venue: "Thalia Hall", date: "2025-09-23" },
+  { artist: "Emotional Oranges", venue: "Riviera Theatre", date: "2025-09-23" },
+  { artist: "James Marriott", venue: "Bottom Lounge", date: "2025-09-23" },
+  { artist: "Isabella Lovestory", venue: "Subterranean", date: "2025-09-23" },
+  { artist: "Issa Rae", venue: "Chicago Theatre", date: "2025-09-23" },
+  { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-23" },
+  { artist: "The Super Carlin Brothers", venue: "City Winery", date: "2025-09-23" },
+  { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-23" },
+  { artist: "Radio Free Alice", venue: "Schubas", date: "2025-09-23" },
+  { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-23" },
+  { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-23" },
+  { artist: "He Is Legend", venue: "The Forge Joliet", date: "2025-09-23" },
+  { artist: "Rome Sweet Rome", venue: "Chicago Shakespeare Theatre", date: "2025-09-23" },
+  { artist: "Chicago Architecture Center River Cruise Aboard Chicagos First Lady", venue: "Chicagos First Lady", date: "2025-09-23" },
+  { artist: "Drunk Shakespeare", venue: "The Lion Theatre", date: "2025-09-23" },
+  { artist: "Nba Youngboy", venue: "United Center", date: "2025-09-24" },
+  { artist: "Twenty One Pilots", venue: "Park Credit Union 1 Amphitheatre", date: "2025-09-24" },
+  { artist: "Chicago Cubs", venue: "Field", date: "2025-09-24" },
+  { artist: "Se Regalan Dudas Podcast", venue: "House Of Blues Chicago", date: "2025-09-24" },
+  { artist: "Ethan Regan", venue: "Lincoln Hall", date: "2025-09-24" },
+  { artist: "Gillian Welch", venue: "Auditorium Theatre Chicago", date: "2025-09-24" },
+  { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-24" },
+  { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-24" },
+  { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-24" },
+  { artist: "Barstool Sports", venue: "Joes On Weed", date: "2025-09-24" },
+  { artist: "The Dreggs", venue: "Schubas", date: "2025-09-24" },
+  { artist: "Northwestern Wildcats Womens Volleyball", venue: "Ryan Arena", date: "2025-09-24" },
+  { artist: "God Save The Queen   Queen Tribute", venue: "Charles Arcada Theatre", date: "2025-09-24" },
+  { artist: "Vision Video", venue: "Bottom Lounge", date: "2025-09-24" },
+  { artist: "Bass Drum Of Death", venue: "Beat Kitchen", date: "2025-09-24" },
+  { artist: "Catch Me If You Can", venue: "Marriott Theatre Lincolnshire", date: "2025-09-24" },
+  { artist: "Catch Me If You Can", venue: "Marriott Theatre Lincolnshire", date: "2025-09-24" },
+  { artist: "Spanish Love Songs", venue: "Subterranean", date: "2025-09-24" },
+  { artist: "Palmyra", venue: "Evanston Space", date: "2025-09-24" },
+  { artist: "Twenty Sided Tavern", venue: "Broadway Playhouse At Water Tower Place", date: "2025-09-24" },
+  { artist: "Taco", venue: "City Winery", date: "2025-09-24" },
+  { artist: "This Too Shall Slap", venue: "Second City Chicago", date: "2025-09-24" },
+  { artist: "The Second City Mainstage 113Th Revue", venue: "Second City Chicago", date: "2025-09-24" },
+  { artist: "Nation Of Language", venue: "Thalia Hall", date: "2025-09-24" },
+  { artist: "Ava The Secret Conversations", venue: "Fine Arts Building Chicago", date: "2025-09-24" },
+  { artist: "Keith Urban", venue: "United Center", date: "2025-09-25" },
+  { artist: "Chicago Cubs", venue: "Field", date: "2025-09-25" },
+  { artist: "Louis Ck", venue: "Chicago Theatre", date: "2025-09-25" },
+  { artist: "Deltron 3030", venue: "House Of Blues Chicago", date: "2025-09-25" },
+  { artist: "Sam Fender", venue: "Byline Bank Aragon Ballroom", date: "2025-09-25" },
+  { artist: "Renee Rapp", venue: "Allstate Arena", date: "2025-09-25" },
+  { artist: "Ken Burns", venue: "Auditorium Theatre Chicago", date: "2025-09-25" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-25" },
+  { artist: "Jefferson Starship", venue: "Charles Arcada Theatre", date: "2025-09-25" },
+  { artist: "Panda Bear", venue: "Thalia Hall", date: "2025-09-25" },
+  { artist: "Big Jay Oakerson", venue: "Chicago Improv", date: "2025-09-25" },
+  { artist: "Wait Wait Dont Tell Me", venue: "Studebaker Theater", date: "2025-09-25" },
+  { artist: "The Last Revel", venue: "Garcias Chicago", date: "2025-09-25" },
+  { artist: "Kashmir   Led Zeppelin Tribute", venue: "Plaines Des Plaines Theatre", date: "2025-09-25" },
+  { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-25" },
+  { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-25" },
+  { artist: "Anamanaguchi", venue: "Metro Chicago", date: "2025-09-25" },
+  { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-25" },
+  { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-25" },
+  { artist: "Chicago Symphony Orchestra", venue: "Chicago Symphony Center", date: "2025-09-25" },
+  { artist: "Divorce", venue: "Schubas", date: "2025-09-25" },
+  { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-25" },
+  { artist: "Hunter Hayes", venue: "Genesee Theatre", date: "2025-09-25" },
+  { artist: "The Wilder Blue", venue: "Joes On Weed Street", date: "2025-09-25" },
+  { artist: "Coco Montoya", venue: "Charles Arcada Theatre", date: "2025-09-25" },
+  { artist: "Chicago Cubs", venue: "Field", date: "2024-09-26" },
+  { artist: "Mana", venue: "United Center", date: "2025-09-26" },
+  { artist: "The World Of Hans Zimmer", venue: "Allstate Arena", date: "2025-09-26" },
+  { artist: "Wolf Alice", venue: "Vic Theatre", date: "2025-09-26" },
+  { artist: "Louis Ck", venue: "Chicago Theatre", date: "2025-09-26" },
+  { artist: "Turnstile", venue: "Huntington Bank Pavilion At Northerly Island", date: "2025-09-26" },
+  { artist: "Ron White", venue: "Hard Rock Casino Northern Indiana", date: "2025-09-26" },
+  { artist: "Carl Cox", venue: "Navy Pier", date: "2025-09-26" },
+  { artist: "Michael Schenker", venue: "Plaines Des Plaines Theatre", date: "2025-09-26" },
+  { artist: "Yolanda Del Rio", venue: "Copernicus Center", date: "2025-09-26" },
+  { artist: "Mo Lowda And The Humble", venue: "Park West", date: "2025-09-26" },
+  { artist: "Tchami", venue: "Radius Chicago", date: "2025-09-26" },
+  { artist: "Cartel", venue: "House Of Blues Chicago", date: "2025-09-26" },
+  { artist: "Cochise", venue: "Avondale Music Hall", date: "2025-09-26" },
+  { artist: "Symphony X", venue: "The Forge Joliet", date: "2025-09-26" },
+  { artist: "Sports   The Band", venue: "Beat Kitchen", date: "2025-09-26" },
+  { artist: "Normal Gossip", venue: "Riviera Theatre", date: "2025-09-26" },
+  { artist: "Cold Waves", venue: "Metro Chicago", date: "2025-09-26" },
+  { artist: "Blake Whiten", venue: "Carols Pub", date: "2025-09-26" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-26" },
+  { artist: "Ronnie Baker Brooks", venue: "Fitzgeralds Berwyn", date: "2025-09-26" },
+  { artist: "Martin Sexton", venue: "North Shore Center", date: "2025-09-26" },
+  { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-26" },
+  { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-26" },
+  { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-26" },
+  { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-28" },
+  { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-28" },
+  { artist: "Catch Me If You Can", venue: "Marriott Theatre Lincolnshire", date: "2025-09-28" },
+  { artist: "Demxntia", venue: "Beat Kitchen", date: "2025-09-28" },
+  { artist: "Hand Habits", venue: "Empty Bottle", date: "2025-09-28" },
+  { artist: "Catch Me If You Can", venue: "Marriott Theatre Lincolnshire", date: "2025-09-28" },
+  { artist: "Chicago Cubs", venue: "Field", date: "2024-09-27" },
+  { artist: "Mana", venue: "United Center", date: "2025-09-27" },
+  { artist: "Papa Roach", venue: "Park Credit Union 1 Amphitheatre", date: "2025-09-27" },
+  { artist: "Holy Priest", venue: "Ramova Theatre", date: "2025-09-27" },
+  { artist: "Northwestern Wildcats Football", venue: "Medicine Field At Martin Stadium", date: "2025-06-05" },
+  { artist: "Louis Ck", venue: "Chicago Theatre", date: "2025-09-27" },
+  { artist: "Morrissey", venue: "Byline Bank Aragon Ballroom", date: "2025-09-27" },
+  { artist: "Elo   Electric Light Orchestra", venue: "Plaines Des Plaines Theatre", date: "2025-09-27" },
+  { artist: "Rupauls Drag Race", venue: "Rosemont Theatre", date: "2025-09-27" },
+  { artist: "Sg Lewis", venue: "Radius Chicago", date: "2025-09-27" },
+  { artist: "Bruce Dickinson", venue: "Riviera Theatre", date: "2025-09-27" },
+  { artist: "Michael Schenker", venue: "Charles Arcada Theatre", date: "2025-09-27" },
+  { artist: "Lamb Of God", venue: "The Venue At Horseshoe Casino Hammond", date: "2025-09-27" },
+  { artist: "Fleshwater", venue: "Thalia Hall", date: "2025-09-27" },
+  { artist: "Godspeed You Black Emperor", venue: "Bohemian National Cemetery", date: "2025-09-27" },
+  { artist: "Chicago Fire", venue: "Field", date: "2025-09-27" },
+  { artist: "Cary Elwes", venue: "Auditorium Theatre Chicago", date: "2025-09-27" },
+  { artist: "Andy And Shani", venue: "Copernicus Center", date: "2025-09-27" },
+  { artist: "The Mountain Goats", venue: "Salt Shed", date: "2025-09-27" },
+  { artist: "Lil Tracy", venue: "House Of Blues Chicago", date: "2025-09-27" },
+  { artist: "Kota The Friend", venue: "Patio Theater", date: "2025-09-27" },
+  { artist: "Big Jay Oakerson", venue: "Chicago Improv", date: "2025-09-27" },
+  { artist: "Oracle Sisters", venue: "Lincoln Hall", date: "2025-09-27" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-27" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-27" },
+  { artist: "Sleep Token", venue: "Allstate Arena", date: "2025-09-28" },
+  { artist: "Chicago Cubs", venue: "Field", date: "2024-09-28" },
+  { artist: "Molotov", venue: "Byline Bank Aragon Ballroom", date: "2025-09-28" },
+  { artist: "Cornerstone Of Rock", venue: "Charles Arcada Theatre", date: "2025-09-28" },
+  { artist: "Blackberry Smoke", venue: "Rialto Square Theatre", date: "2025-09-28" },
+  { artist: "Corinne Bailey Rae", venue: "Cahn Auditorium", date: "2025-09-28" },
+  { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-28" },
+  { artist: "Waterparks", venue: "Evanston Space", date: "2025-09-28" },
+  { artist: "California Honeydrops", venue: "Thalia Hall", date: "2025-09-28" },
+  { artist: "Marc E Bassy", venue: "Avondale Music Hall", date: "2025-09-28" },
+  { artist: "Joss Stone", venue: "North Shore Center", date: "2025-09-28" },
+  { artist: "The Raveonettes", venue: "Bottom Lounge", date: "2025-09-28" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-28" },
+  { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-28" },
+  { artist: "Cold Waves", venue: "Metro Chicago", date: "2025-09-28" },
+  { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-28" },
+  { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-28" },
+  { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-28" },
+  { artist: "Northwestern Wildcats Womens Volleyball", venue: "Ryan Arena", date: "2025-09-28" },
+  { artist: "Chicago Symphony Orchestra", venue: "Chicago Symphony Center", date: "2025-09-28" },
+  { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-28" },
+  { artist: "Dial M For Murder", venue: "Terrace Drury Lane Theatre Oakbrook Terrace", date: "2025-09-28" },
+  { artist: "Catch Me If You Can", venue: "Marriott Theatre Lincolnshire", date: "2025-09-28" },
+  { artist: "Demxntia", venue: "Beat Kitchen", date: "2025-09-28" },
+  { artist: "Hand Habits", venue: "Empty Bottle", date: "2025-09-28" },
+  { artist: "Catch Me If You Can", venue: "Marriott Theatre Lincolnshire", date: "2025-09-28" },
+  { artist: "Chicago Cubs", venue: "Field", date: "2024-09-27" },
+  { artist: "Mana", venue: "United Center", date: "2025-09-27" },
+  { artist: "Papa Roach", venue: "Park Credit Union 1 Amphitheatre", date: "2025-09-27" },
+  { artist: "Holy Priest", venue: "Ramova Theatre", date: "2025-09-27" },
+  { artist: "Northwestern Wildcats Football", venue: "Medicine Field At Martin Stadium", date: "2025-06-05" },
+  { artist: "Louis Ck", venue: "Chicago Theatre", date: "2025-09-27" },
+  { artist: "Morrissey", venue: "Byline Bank Aragon Ballroom", date: "2025-09-27" },
+  { artist: "Elo   Electric Light Orchestra", venue: "Plaines Des Plaines Theatre", date: "2025-09-27" },
+  { artist: "Rupauls Drag Race", venue: "Rosemont Theatre", date: "2025-09-27" },
+  { artist: "Sg Lewis", venue: "Radius Chicago", date: "2025-09-27" },
+  { artist: "Bruce Dickinson", venue: "Riviera Theatre", date: "2025-09-27" },
+  { artist: "Michael Schenker", venue: "Charles Arcada Theatre", date: "2025-09-27" },
+  { artist: "Lamb Of God", venue: "The Venue At Horseshoe Casino Hammond", date: "2025-09-27" },
+  { artist: "Fleshwater", venue: "Thalia Hall", date: "2025-09-27" },
+  { artist: "Godspeed You Black Emperor", venue: "Bohemian National Cemetery", date: "2025-09-27" },
+  { artist: "Chicago Fire", venue: "Field", date: "2025-09-27" },
+  { artist: "Cary Elwes", venue: "Auditorium Theatre Chicago", date: "2025-09-27" },
+  { artist: "Andy And Shani", venue: "Copernicus Center", date: "2025-09-27" },
+  { artist: "The Mountain Goats", venue: "Salt Shed", date: "2025-09-27" },
+  { artist: "Lil Tracy", venue: "House Of Blues Chicago", date: "2025-09-27" },
+  { artist: "Kota The Friend", venue: "Patio Theater", date: "2025-09-27" },
+  { artist: "Big Jay Oakerson", venue: "Chicago Improv", date: "2025-09-27" },
+  { artist: "Oracle Sisters", venue: "Lincoln Hall", date: "2025-09-27" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-27" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-27" },
+  { artist: "Sleep Token", venue: "Allstate Arena", date: "2025-09-28" },
+  { artist: "Chicago Cubs", venue: "Field", date: "2024-09-28" },
+  { artist: "Molotov", venue: "Byline Bank Aragon Ballroom", date: "2025-09-28" },
+  { artist: "Cornerstone Of Rock", venue: "Charles Arcada Theatre", date: "2025-09-28" },
+  { artist: "Blackberry Smoke", venue: "Rialto Square Theatre", date: "2025-09-28" },
+  { artist: "Corinne Bailey Rae", venue: "Cahn Auditorium", date: "2025-09-28" },
+  { artist: "Grease", venue: "Heights Metropolis Performing Arts Centre", date: "2025-09-28" },
+  { artist: "Waterparks", venue: "Evanston Space", date: "2025-09-28" },
+  { artist: "California Honeydrops", venue: "Thalia Hall", date: "2025-09-28" },
+  { artist: "Marc E Bassy", venue: "Avondale Music Hall", date: "2025-09-28" },
+  { artist: "Joss Stone", venue: "North Shore Center", date: "2025-09-28" },
+  { artist: "The Raveonettes", venue: "Bottom Lounge", date: "2025-09-28" },
+  { artist: "Joffrey Ballet", venue: "Lyric Opera House", date: "2025-09-28" },
+  { artist: "Ashland Avenue", venue: "Goodman Theatre", date: "2025-09-28" },
+  { artist: "Cold Waves", venue: "Metro Chicago", date: "2025-09-28" },
+  { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-28" },
+  { artist: "Million Dollar Quartet", venue: "Paramount Theatre Aurora", date: "2025-09-28" },
+  { artist: "The First Lady Of Television", venue: "North Shore Center", date: "2025-09-28" },
+  { artist: "Northwestern Wildcats Womens Volleyball", venue: "Ryan Arena", date: "2025-09-28" },
+  { artist: "Chicago Symphony Orchestra", venue: "Chicago Symphony Center", date: "2025-09-28" },
+];
+
+
 ];
 
 function formatRecs(dateHint) {
   const norm = (s) => (s || "").toLowerCase();
   const wanted = norm(dateHint);
-  const upcoming = RECS
+  const upcoming = RECOMMENDED_SHOWS
     .filter(r => !wanted || norm(r.date).includes(wanted))
     .sort((a, b) => new Date(a.date) - new Date(b.date))
     .slice(0, 3);
@@ -700,24 +975,21 @@ function formatRecs(dateHint) {
 
 function parseDateFromText(text) {
   const m = String(text || "").match(DATE_WORDS);
-  if (!m) return null; // very light parser: keep original token, we only need a filter string
+  if (!m) return null;
   return m[0];
 }
-
-function formatHuman(d) { // input ISO 'YYYY-MM-DD' -> 'Aug 18'
+function formatHuman(d) {
   const dt = new Date(d + "T12:00:00");
   return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
-
 function upcomingRecommendations(requestedToken) {
   const todayISO = new Date().toISOString().slice(0,10);
   let pool = RECOMMENDED_SHOWS.filter(s => s.date >= todayISO);
 
-  // if user mentioned a specific month/day token, lightly filter by month/day text
   if (requestedToken) {
     const t = requestedToken.toLowerCase();
     pool = pool.filter(s => {
-      const pretty = formatHuman(s.date).toLowerCase(); // 'aug 18'
+      const pretty = formatHuman(s.date).toLowerCase();
       return pretty.includes(t.replace(",", ""));
     });
     if (pool.length === 0) pool = RECOMMENDED_SHOWS.filter(s => s.date >= todayISO);
@@ -729,10 +1001,10 @@ function upcomingRecommendations(requestedToken) {
     .map((s, i) => `${i+1}. ${s.artist} @ ${s.venue} on ${formatHuman(s.date)}`);
 }
 
-/* ===================== OpenAI ===================== */
-
+/* =====================  OpenAI  ===================== */
 async function callOpenAI(messages) {
-  const sysPrompt = `You are FTE's intake assistant — a conversational, personable, and fun bot built by reformed ticket brokers who now want to help fans beat scalpers and navigate the broken ticketing industry.
+  const sysPrompt = `
+You are FTE's intake assistant — a conversational, personable, and fun bot built by reformed ticket brokers who now want to help fans beat scalpers and navigate the broken ticketing industry.
 
 CORE GOALS
 - Capture ticket requests efficiently: artist_or_event, ticket_qty, budget_tier, date_or_date_range, name, email, optional phone/notes
@@ -760,35 +1032,11 @@ CONVERSATIONAL STYLE & PERSONALITY
 IDENTITY & EDUCATION (when asked)
 - "What are you?" → "I'm the FTE assistant, built by ex-brokers who got tired of scalpers ripping off fans. Think of me as your insider friend who knows how this whole ticket game really works. I'm in beta right now but getting smarter every day!"
 - About FTE → "FTE (Fair Ticket Exchange) was created by reformed industry insiders who got sick of seeing fans get gouged. We used to be part of the problem, now we're the solution - helping you navigate this crazy industry without getting burned."
-- About the industry → Educate about scalper tactics, Ticketmaster's hidden fees, dynamic pricing tricks. Be negative toward scalpers and legacy practices: "Unlike those scalpers on StubHub charging 300% markup..." or "Ticketmaster's 'convenience' fees are anything but convenient"
-- Government/FTC action → "The FTC is finally cracking down on these predatory practices - it's about time fans got some protection from this industry!"
-
-SEARCH & RECOMMENDATIONS
-- Price questions: "I found tickets starting at $X - way better than what scalpers are charging! How many tickets do you need?"
-- If can't find exact prices: "I can't pull exact prices right now — that feature's coming soon — but our team will reach out with current pricing and tips on how to get the best deal."
-- Recommendations: Use web_search for current events, present as enthusiastic suggestions
-- Be excited about recommendations: "Oh, you're gonna love this lineup!" / "This show is going to be incredible!"
-- Always suggest checking multiple dates/venues if available
-
-INDUSTRY POSITIONING & TONE
-- Cool, fun, rebellious but helpful - the anti-scalper ticket buddy
-- Lightly negative toward scalpers, Ticketmaster, and unfair practices when relevant
-- "Real brokers, not scalpers looking to gouge you"
-- "No surprise fees, no bait-and-switch pricing like the big guys"
-- "With all these industry tricks, you need someone in your corner"
-- Supportive and persuasive toward fans — encourage them to lock in tickets
-- Show genuine enthusiasm for live events and helping fans
-
-CONVERSATION FLOW
-- Capture mode: Ask only for missing details, one at a time, conversationally
-- Casual mode: If they're chatting randomly, banter back but always circle toward tickets
-- Build rapport while steering toward events: "That sounds awesome! Have you been to [venue] before?"
-- Use their interests to suggest events: "Since you like [genre], you'd probably love [similar artist]"
-- If conversation gets too off-topic, gently redirect: "That's cool! You know what else is cool? [relevant event]"
-- Confirmation: Once details are confirmed, show them cleanly in plain text (no asterisks, no markdown), then CALL capture_ticket_request
+- About the industry → Educate about scalper tactics, Ticketmaster's hidden fees, dynamic pricing tricks. Be negative toward scalpers and legacy practices.
+- Government/FTC action → "The FTC is finally cracking down on these predatory practices."
 
 DATA TO CAPTURE (for capture_ticket_request)
-- artist_or_event (required) — e.g., "Jonas Brothers"
+- artist_or_event (required)
 - ticket_qty (required, integer)
 - name (required)
 - email (required)
@@ -799,195 +1047,8 @@ Notes:
 - Do NOT ask for date/date-range or budget. If the user volunteers them, keep them as optional extras.
 - Ask for missing required fields one at a time.
 - When the user confirms the summary, CALL capture_ticket_request immediately.
-
-RESTRICTIONS & IMPORTANT RULES
-- Never ask for City/Residence
-- Never tell the user to "fill a form" - if they explicitly request the manual form, the website handles that
-- Do NOT ask what “type” of show before recommending events (no categories like high-energy vs acoustic). You don’t have categorized lists.
-- Always maintain core ticket request functionality
-- Be conversational but efficient - don't lose them in small talk
-- Use enthusiasm to help hesitant users commit to going
-- Never be pushy, but be persuasive in a friendly way
-- When user confirms details, immediately CALL capture_ticket_request
-- If they ask for web_search for events/prices, use the tool first then respond enthusiastically
-
-CONVERSATION EXAMPLES
-User: "How's the weather?"
-You: "Perfect weather for an outdoor concert! Speaking of which, any shows on your radar lately?"
-
-User: "I'm bored"
-You: "Sounds like you need some live music in your life! What kind of vibe are you feeling - high-energy concert, chill acoustic show, or maybe a comedy show?"
-
-User: "What do you do?"
-You: "I help fans like you get tickets without getting ripped off! I was built by reformed ticket brokers who got sick of seeing fans pay ridiculous scalper prices. Think of me as your insider friend who knows all the tricks."
-
-**CASUAL CONVERSATION STARTERS**
-User: "How's the weather?"
-You: "Perfect weather for an outdoor concert! Speaking of which, any shows on your radar lately?"
-
-User: "I'm bored"
-You: "Sounds like you need some live music in your life! What artist or show has been on your mind?"
-
-User: "What's up?"
-You: "Just helping fans score tickets without getting ripped off! What shows are you eyeing?"
-
-User: "How are you?"
-You: "Living the dream - helping people get to amazing shows! What's the last concert you went to?"
-
-User: "What's good?"
-You: "Live music is always good! Any artists you've been wanting to see?"
-
-**IDENTITY & EXPLANATION QUESTIONS**
-User: "What are you?"
-You: "I'm the FTE assistant, built by ex-brokers who got tired of scalpers ripping off fans. Think of me as your insider friend who knows how this whole ticket game really works. I'm in beta right now but getting smarter every day!"
-
-User: "Who made you?"
-You: "Reformed ticket brokers who got sick of seeing fans get gouged! We used to be part of the problem, now we're the solution."
-
-User: "What is FTE?"
-You: "FTE (Fair Ticket Exchange) was created by reformed industry insiders who got sick of seeing fans get gouged. We used to be part of the problem, now we're the solution - helping you navigate this crazy industry without getting burned."
-
-User: "How does this work?"
-You: "Super simple! I grab your ticket request details, then our real team reaches out with the best options and pricing. No bots, no runaround - just real people who know the game helping you out."
-
-User: "Are you real?"
-You: "I'm an AI assistant, but I'm backed by real reformed brokers who actually care about fans! Once I capture your request, real humans take over to get you sorted."
-
-**INDUSTRY & EDUCATION QUESTIONS**
-User: "Why are tickets so expensive?"
-You: "Scalpers and Ticketmaster's monopoly, mostly. Dynamic pricing, hidden fees, artificial scarcity - the whole industry is rigged against fans. That's exactly why we exist!"
-
-User: "What's wrong with Ticketmaster?"
-You: "Where do I start? Hidden fees, dynamic pricing that changes by the minute, and they basically have a monopoly. Their 'convenience' fees are anything but convenient!"
-
-User: "Are you better than StubHub?"
-You: "Way better! Unlike those scalpers on StubHub charging 300% markup, we're actual reformed brokers helping fans get fair prices. No surprise fees, no bait-and-switch."
-
-User: "What about scalpers?"
-You: "Scalpers are the worst - they buy up tickets just to gouge fans. We're the opposite - reformed brokers who decided helping fans is way better than ripping them off."
-
-User: "Is this legal?"
-You: "Totally legal! We're licensed brokers, not sketchy scalpers. The FTC is finally cracking down on predatory practices - it's about time fans got some protection!"
-
-**PRICE & RECOMMENDATION QUESTIONS**
-User: "How much are tickets?"
-You: "Let me search for current pricing! What show are you looking at?"
-
-User: "What's happening this weekend?"
-You: "Let me check what's going on! Any particular type of show you're in the mood for?"
-
-User: "Any good concerts coming up?"
-You: "Always! What artists are you into? I'll find some shows that'll blow your mind."
-
-User: "What should I see?"
-You: "Depends on your vibe! What's the last show you loved? I can find something similar."
-
-User: "Is [artist] touring?"
-You: "Let me check their tour dates! Are you hoping to catch them locally or willing to travel?"
-
-**HESITATION & OBJECTIONS**
-User: "Tickets are too expensive"
-You: "I hear you - that's exactly why we exist! Let me find you something in your budget. What's your max per ticket?"
-
-User: "I don't know if I want to go"
-You: "Trust me, you'll regret missing a great show more than going! What's holding you back?"
-
-User: "Maybe later"
-You: "Shows sell out fast these days! At least let me grab your info so I can hit you up when something perfect comes along?"
-
-User: "I'm not sure"
-You: "No pressure! But live music hits different than streaming. What artist would make you say 'hell yes' immediately?"
-
-User: "It's too far"
-You: "Sometimes the best shows are worth the trip! Plus, I might know about closer dates you haven't seen yet."
-
-**TECHNICAL & PROCESS QUESTIONS**
-User: "Do I have to pay now?"
-You: "Nope! I just capture your request, then our team reaches out with options. No payment until you're ready to lock in tickets you actually want."
-
-User: "What happens after this?"
-You: "Our real team will hit you up with the best options and current pricing. They'll walk you through everything - no bots, just real people who know the game."
-
-User: "Is this a scam?"
-You: "Definitely not! We're licensed brokers who got tired of the industry screwing fans. You won't pay anything until you see exactly what you're getting."
-
-User: "Why do you need my email?"
-You: "So our team can reach out with your options! We're not spamming you - just connecting you with real people who can get you sorted."
-
-User: "Can I trust you?"
-You: "We're reformed industry insiders who decided helping fans is better than gouging them. Check us out - we're the real deal, not some sketchy operation."
-
-**RANDOM CONVERSATION**
-User: "I'm hungry"
-You: "Nothing beats stadium nachos at a game! Speaking of which, any sports events on your radar?"
-
-User: "I'm tired"
-You: "Sounds like you need some energizing live music! What gets you pumped up?"
-
-User: "It's Monday"
-You: "Mondays are better when you have a show to look forward to! What's on your concert wishlist?"
-
-User: "I hate my job"
-You: "Live music is the perfect escape! What artist always puts you in a good mood?"
-
-User: "I'm stressed"
-You: "Concert therapy is real! What kind of show helps you unwind - something chill or high-energy?"
-
-**SPECIFIC ARTIST/VENUE QUESTIONS**
-User: "I want to see [Artist]"
-You: "Great choice! [Artist] puts on an incredible show. How many tickets do you need?"
-
-User: "Is [Venue] a good place to see shows?"
-You: "Oh yeah, [Venue] is awesome! Great sound, good vibes. What show are you thinking about there?"
-
-User: "I've never been to [Venue]"
-You: "You're in for a treat! [Venue] is a great spot. What show is bringing you there for the first time?"
-
-**BUDGET CONCERNS**
-User: "I'm broke"
-You: "I feel you! Let me find something that won't break the bank. What's your absolute max per ticket?"
-
-User: "Do you have cheap tickets?"
-You: "I can definitely work with a budget! What's your range, and what show are you hoping to catch?"
-
-User: "Student discounts?"
-You: "Let me see what I can do! What show are you looking at, and how many tickets?"
-
-**GROUP/PLANNING QUESTIONS**
-User: "I'm going with friends"
-You: "Even better! Group shows are the best. How many tickets total?"
-
-User: "It's for a date"
-You: "Nice! Nothing beats live music for a date. What kind of vibe are you going for?"
-
-User: "Birthday present"
-You: "Perfect gift idea! What kind of music does the birthday person love?"
-
-User: "Anniversary"
-You: "So sweet! What artist would make it extra special?"
-
-**NEGATIVE/SKEPTICAL**
-User: "This seems sketchy"
-You: "I get the skepticism - the ticket world is full of scammers! We're the opposite - reformed brokers who got tired of fans getting ripped off. No payment until you see exactly what you're getting."
-
-User: "I don't trust ticket brokers"
-You: "Smart! Most brokers are terrible. We're the reformed ones who decided helping fans is way better than gouging them. That's literally why we exist."
-
-User: "I got scammed before"
-You: "That sucks, and it's exactly why we do this! We're here to be the good guys in an industry full of bad actors."
-
-**ENDING CONVERSATIONS**
-User: "Thanks but no thanks"
-You: "No worries! If you change your mind or hear about a show you can't miss, I'll be here to help you avoid the scalpers!"
-
-User: "I'll think about it"
-You: "Totally fair! Just remember - the good shows sell out fast. Hit me up when you're ready!"
-
-User: "Maybe next time"
-You: "Sounds good! Live music will still be here when you're ready. Hope to help you catch an amazing show soon!"
-
-Remember: You're the cool, knowledgeable friend who's genuinely excited to help fans while sticking it to scalpers and the broken industry. Keep it fun, keep it real, and always get them to that show!
 `;
+
   const body = {
     model: "gpt-4o-mini",
     temperature: 0.2,
@@ -1003,7 +1064,14 @@ Remember: You're the cool, knowledgeable friend who's genuinely excited to help 
             properties: {
               artist_or_event: { type: "string" },
               ticket_qty: { type: "integer" },
-              budget_tier: { type: "string", enum: [ "<$50","$50–$99","$100–$149","$150–$199", "$200–$249","$250–$299","$300–$349","$350–$399", "$400–$499","$500+" ] },
+              budget_tier: {
+                type: "string",
+                enum: [
+                  "<$50","$50–$99","$100–$149","$150–$199",
+                  "$200–$249","$250–$299","$300–$349","$350–$399",
+                  "$400–$499","$500+"
+                ]
+              },
               date_or_date_range: { type: "string" },
               name: { type: "string" },
               email: { type: "string" },
@@ -1024,7 +1092,7 @@ Remember: You're the cool, knowledgeable friend who's genuinely excited to help 
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(body )
+    body: JSON.stringify(body)
   });
 
   if (!resp.ok) throw new Error(await resp.text());
@@ -1034,36 +1102,29 @@ Remember: You're the cool, knowledgeable friend who's genuinely excited to help 
 function getToolCalls(openaiResp) {
   return openaiResp?.choices?.[0]?.message?.tool_calls || [];
 }
-
 function getAssistantText(openaiResp) {
   return openaiResp?.choices?.[0]?.message?.content || "";
 }
 
-/* ===================== Intent helpers ===================== */
-
-function looksLikePrice(msg) {
-  return /(price|prices|cost|how much)/i.test(msg || "");
-}
-
+/* =====================  Intent helpers  ===================== */
+function looksLikePrice(msg) { return /(price|prices|cost|how much)/i.test(msg || ""); }
 function wantsSuggestions(msg = "") {
   const q = (msg || "").toLowerCase();
-  // common words/phrases + misspellings + short forms
   const patterns = [
-    /recomm?end(ation|ations|ed|ing)?/, // recommend / recomend / recommendation(s)
-    /\brecs?\b/, // rec / recs
-    /\brecos?\b/, // reco / recos
-    /\bsuggest(ion|ions|ed|ing)?\b/, // suggest / suggestions
-    /\bideas?\b/, // idea / ideas
-    /what.*(to do|going on|happening)/, // what's to do / what's going on / what's happening
-    /\b(any )?(good )?(shows?|events?)\b/,// any (good) shows/events
-    /(coming up.*show|show.*coming up)/, // show coming up?
-    /\bupcoming\b/ // upcoming
+    /recomm?end(ation|ations|ed|ing)?/,
+    /\brecs?\b/,
+    /\brecos?\b/,
+    /\bsuggest(ion|ions|ed|ing)?\b/,
+    /\bideas?\b/,
+    /what.*(to do|going on|happening)/,
+    /\b(any )?(good )?(shows?|events?)\b/,
+    /(coming up.*show|show.*coming up)/,
+    /\bupcoming\b/
   ];
   return patterns.some((re) => re.test(q));
 }
 
-/* ===================== Azure Function entry ===================== */
-
+/* =====================  Azure Function entry  ===================== */
 module.exports = async function (context, req) {
   context.res = {
     headers: {
@@ -1074,16 +1135,14 @@ module.exports = async function (context, req) {
     }
   };
 
-  if (req.method === "OPTIONS") {
-    context.res.status = 200;
-    context.res.body = {};
-    return;
-  }
+  if (req.method === "OPTIONS") { context.res.status = 200; context.res.body = {}; return; }
 
   // Manual modal capture from Framer
   if (req.body?.direct_capture && req.body?.capture) {
     try {
       await appendToSheet(toRow(req.body.capture));
+      // send confirmation email (best-effort; don't fail the request if email fails)
+      try { await sendConfirmationEmail(req.body.capture); } catch (e) { context.log.warn("Email (manual) failed:", e.message); }
       context.res.status = 200;
       context.res.body = { message: "Saved your request. We’ll follow up soon!" };
     } catch (e) {
@@ -1111,9 +1170,9 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // --- NEW: hard-coded recommendations with the exact format requested
+    // Hard-coded date-based recs
     if (wantsSuggestions(userText)) {
-      const token = parseDateFromText(userText); // optional date token in their message
+      const token = parseDateFromText(userText);
       const list = upcomingRecommendations(token);
       const msg = list.length
         ? `Great! Here are a few options:\n\n${list.join("\n")}\n\nDo any of these interest you?`
@@ -1123,10 +1182,13 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // If the user asks about price, show the placeholder message (no scraping)
+    // Price placeholder
     if (looksLikePrice(userText)) {
       context.res.status = 200;
-      context.res.body = { message: "I can’t pull exact prices right now, but that feature is coming soon — our team will follow up with current pricing and tips to get the best deal. Want me to place a request for you?" };
+      context.res.body = {
+        message:
+          "I can’t pull exact prices right now, but that feature is coming soon — our team will follow up with current pricing and tips to get the best deal. Want me to place a request for you?"
+      };
       return;
     }
 
@@ -1150,7 +1212,14 @@ module.exports = async function (context, req) {
         captureData.budget_tier = normalizeBudgetTier(captureData.budget_tier || "");
         const row = toRow(captureData);
         await appendToSheet(row);
-        finalMessage = `Perfect! I’ve captured your request for ${captureData.ticket_qty} tickets to ${captureData.artist_or_event}. We’ll reach out to ${captureData.email} with options that fit your ${captureData.budget_tier} budget. Thanks, ${captureData.name}!`;
+
+        // send confirmation email (best-effort)
+        try { await sendConfirmationEmail(captureData); } catch (e) { context.log.warn("Email (chat) failed:", e.message); }
+
+        finalMessage =
+          `Perfect! I’ve captured your request for ${captureData.ticket_qty} ` +
+          `tickets to ${captureData.artist_or_event}. We’ll reach out to ${captureData.email} ` +
+          `with options that fit your ${captureData.budget_tier || "—"} budget. Thanks, ${captureData.name || "friend"}!`;
       } catch (e) {
         context.log.error("Sheet append failed:", e);
       }
@@ -1165,6 +1234,3 @@ module.exports = async function (context, req) {
     context.res.body = { error: String(e) };
   }
 };
-
-
-
